@@ -1685,7 +1685,9 @@ void __init alternative_instructions(void)
 	apply_retpolines(__retpoline_sites, __retpoline_sites_end);
 	apply_returns(__return_sites, __return_sites_end);
 
+	printk("clr: Applying alternatives\n");
 	apply_alternatives(__alt_instructions, __alt_instructions_end);
+	printk("clr: Applying alternatives done\n");
 
 	/*
 	 * Now all calls are established. Apply the call thunks if
