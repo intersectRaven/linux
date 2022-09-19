@@ -857,7 +857,7 @@ static inline void memcg_rstat_updated(struct mem_cgroup *memcg, int val)
 	for (; statc; statc = statc->parent) {
 		stats_updates = READ_ONCE(statc->stats_updates) + abs(val);
 		WRITE_ONCE(statc->stats_updates, stats_updates);
-		if (stats_updates < MEMCG_CHARGE_BATCH)
+		if (stats_updates < MEMCG_CHARGE_BATCH * 128)
 			continue;
 
 		/*
