@@ -722,7 +722,7 @@ static inline void memcg_rstat_updated(struct mem_cgroup *memcg, int val)
 	statc = this_cpu_ptr(memcg->vmstats_percpu);
 	for (; statc; statc = statc->parent) {
 		statc->stats_updates += abs(val);
-		if (statc->stats_updates < MEMCG_CHARGE_BATCH)
+		if (statc->stats_updates < MEMCG_CHARGE_BATCH * 128)
 			continue;
 
 		/*
