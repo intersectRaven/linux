@@ -527,7 +527,7 @@ again:
 
 static void __folio_memcg_unlock(struct mem_cgroup *memcg)
 {
-	if (memcg && memcg->move_lock_task == current) {
+	if (likely(memcg && memcg->move_lock_task == current)) {
 		unsigned long flags = memcg->move_lock_flags;
 
 		memcg->move_lock_task = NULL;

@@ -556,7 +556,7 @@ static inline void memcg_rstat_updated(struct mem_cgroup *memcg, int val)
 	for (; statc; statc = statc->parent) {
 		stats_updates = READ_ONCE(statc->stats_updates) + abs(val);
 		WRITE_ONCE(statc->stats_updates, stats_updates);
-		if (stats_updates < MEMCG_CHARGE_BATCH * 128)
+		if (likely(stats_updates < MEMCG_CHARGE_BATCH * 128))
 			continue;
 
 		/*
@@ -746,7 +746,7 @@ void __mod_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
 	__mod_node_page_state(lruvec_pgdat(lruvec), idx, val);
 
 	/* Update memcg and lruvec */
-	if (!mem_cgroup_disabled())
+	if (likely(!mem_cgroup_disabled()))
 		__mod_memcg_lruvec_state(lruvec, idx, val);
 }
 
