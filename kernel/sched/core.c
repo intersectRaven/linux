@@ -554,7 +554,7 @@ void raw_spin_rq_lock_nested(struct rq *rq, int subclass)
 
 	/* Matches synchronize_rcu() in __sched_core_enable() */
 	preempt_disable();
-	if (sched_core_disabled()) {
+	if (likely(sched_core_disabled())) {
 		raw_spin_lock_nested(&rq->__lock, subclass);
 		/* preempt_count *MUST* be > 1 */
 		preempt_enable_no_resched();
@@ -763,7 +763,7 @@ void update_rq_clock(struct rq *rq)
 #endif
 
 	delta = sched_clock_cpu(cpu_of(rq)) - rq->clock;
-	if (delta < 0)
+	if (unlikely(delta < 0))
 		return;
 	rq->clock += delta;
 	update_rq_clock_task(rq, delta);
@@ -6077,7 +6077,7 @@ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 	struct rq *rq_i;
 	bool need_sync;
 
-	if (!sched_core_enabled(rq))
+	if (likely(!sched_core_enabled(rq)))
 		return __pick_next_task(rq, prev, rf);
 
 	cpu = cpu_of(rq);
@@ -8526,10 +8526,22 @@ SYSCALL_DEFINE3(sched_getaffinity, pid_t, pid, unsigned int, len,
 	return ret;
 }
 
+static DEFINE_PER_CPU(unsigned long, last_yield);
+
 static void do_sched_yield(void)
 {
 	struct rq_flags rf;
 	struct rq *rq;
+	int cpu = raw_smp_processor_id();
+
+	cond_resched();
+
+	/* rate limit yielding to something sensible */
+
+	if (!time_after(jiffies, per_cpu(last_yield, cpu)))
+		return;
+
+	per_cpu(last_yield, cpu) = jiffies;
 
 	rq = this_rq_lock_irq(&rf);
 
@@ -8560,7 +8572,7 @@ SYSCALL_DEFINE0(sched_yield)
 #if !defined(CONFIG_PREEMPTION) || defined(CONFIG_PREEMPT_DYNAMIC)
 int __sched __cond_resched(void)
 {
-	if (should_resched(0)) {
+	if (unlikely(should_resched(0))) {
 		preempt_schedule_common();
 		return 1;
 	}
