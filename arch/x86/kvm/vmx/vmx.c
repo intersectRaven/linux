@@ -8766,4 +8766,4 @@ err_l1d_flush:
 	kvm_x86_vendor_exit();
 	return r;
 }
-module_init(vmx_init);
+late_initcall(vmx_init);
