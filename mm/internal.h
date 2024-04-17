@@ -270,7 +270,7 @@ struct alloc_context {
 static inline unsigned int buddy_order(struct page *page)
 {
 	/* PageBuddy() must be checked by the caller */
-	return page_private(page);
+	return page_buddy_order(page);
 }
 
 /*
@@ -284,7 +284,7 @@ static inline unsigned int buddy_order(struct page *page)
  * times, potentially observing different values in the tests and the actual
  * use of the result.
  */
-#define buddy_order_unsafe(page)	READ_ONCE(page_private(page))
+#define buddy_order_unsafe(page)	READ_ONCE(page_buddy_order(page))
 
 /*
  * This function checks whether a page is free && is the buddy
@@ -449,7 +449,7 @@ extern void post_alloc_hook(struct page *page, unsigned int order,
 					gfp_t gfp_flags);
 extern int user_min_free_kbytes;
 
-extern void free_unref_page(struct page *page, unsigned int order);
+extern void free_unref_page(struct page *page, unsigned int order, unsigned short int mgen);
 extern void free_unref_page_list(struct list_head *list);
 
 extern void zone_pcp_reset(struct zone *zone);
@@ -923,6 +923,7 @@ extern struct workqueue_struct *mm_percpu_wq;
 void try_to_unmap_flush(void);
 void try_to_unmap_flush_dirty(void);
 void flush_tlb_batched_pending(struct mm_struct *mm);
+void fold_ubc(struct tlbflush_unmap_batch *dst, struct tlbflush_unmap_batch *src);
 #else
 static inline void try_to_unmap_flush(void)
 {
@@ -931,6 +932,9 @@ static inline void try_to_unmap_flush_dirty(void)
 {
 }
 static inline void flush_tlb_batched_pending(struct mm_struct *mm)
+{
+}
+static inline void fold_ubc(struct tlbflush_unmap_batch *dst, struct tlbflush_unmap_batch *src)
 {
 }
 #endif /* CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH */
@@ -1266,4 +1270,79 @@ static inline void shrinker_debugfs_remove(struct dentry *debugfs_entry,
 }
 #endif /* CONFIG_SHRINKER_DEBUG */
 
+#if defined(CONFIG_MIGRATION) && defined(CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH)
+void check_migrc_flush(unsigned short int mgen);
+void migrc_flush(void);
+void rmap_flush_start(void);
+void rmap_flush_end(struct tlbflush_unmap_batch *batch);
+
+/*
+ * Reset the indicator indicating there are no writable mappings at the
+ * beginning of every rmap traverse for unmap.  migrc can work only when
+ * all the mappings are read-only.
+ */
+static inline void can_migrc_init(void)
+{
+	current->can_migrc = true;
+}
+
+/*
+ * Mark the folio is not applicable to migrc once it found a writble or
+ * dirty pte during rmap traverse for unmap.
+ */
+static inline void can_migrc_fail(void)
+{
+	current->can_migrc = false;
+}
+
+/*
+ * Check if all the mappings are read-only and read-only mappings even
+ * exist.
+ */
+static inline bool can_migrc_test(void)
+{
+	return current->can_migrc && current->tlb_ubc_ro.flush_required;
+}
+
+static inline unsigned short int mgen_latest(unsigned short int a, unsigned short int b)
+{
+	if (!a || !b)
+		return a + b;
+
+	/*
+	 * The mgen is wrapped around so let's use this trick.
+	 */
+	if ((short int)(a - b) < 0)
+		return b;
+	else
+		return a;
+}
+
+static inline void update_task_mgen(unsigned short int mgen)
+{
+	current->mgen = mgen_latest(current->mgen, mgen);
+}
+
+static inline unsigned int hand_over_task_mgen(void)
+{
+	return xchg(&current->mgen, 0);
+}
+
+static inline void check_flush_task_mgen(void)
+{
+	check_migrc_flush(xchg(&current->mgen, 0));
+}
+#else /* CONFIG_MIGRATION && CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH */
+static inline void check_migrc_flush(unsigned short int mgen) {}
+static inline void migrc_flush(void) {}
+static inline void rmap_flush_start(void) {}
+static inline void rmap_flush_end(struct tlbflush_unmap_batch *batch) {}
+static inline void can_migrc_init(void) {}
+static inline void can_migrc_fail(void) {}
+static inline bool can_migrc_test(void) { return false; }
+static inline unsigned short int mgen_latest(unsigned short int a, unsigned short int b) { return 0; }
+static inline void update_task_mgen(unsigned short int mgen) {}
+static inline unsigned int hand_over_task_mgen(void) { return 0; }
+static inline void check_flush_task_mgen(void) {}
+#endif
 #endif	/* __MM_INTERNAL_H */
