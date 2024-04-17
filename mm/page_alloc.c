@@ -603,9 +603,12 @@ void destroy_large_folio(struct folio *folio)
 	free_the_page(&folio->page, folio_order(folio));
 }
 
-static inline void set_buddy_order(struct page *page, unsigned int order)
+static inline void set_buddy_order_mgen(struct page *page,
+					unsigned int order,
+					unsigned short int mgen)
 {
-	set_page_private(page, order);
+	set_page_buddy_order(page, order);
+	set_page_buddy_mgen(page, order);
 	__SetPageBuddy(page);
 }
 
@@ -823,7 +826,7 @@ static inline void __free_one_page(struct page *page,
 	}
 
 done_merging:
-	set_buddy_order(page, order);
+	set_buddy_order_mgen(page, order, 0);
 
 	if (fpi_flags & FPI_TO_TAIL)
 		to_tail = true;
@@ -1403,7 +1406,7 @@ static inline void expand(struct zone *zone, struct page *page,
 			continue;
 
 		add_to_free_list(&page[size], zone, high, migratetype);
-		set_buddy_order(&page[size], high);
+		set_buddy_order_mgen(&page[size], high, 0);
 	}
 }
 
@@ -6675,7 +6678,7 @@ static void break_down_buddy_pages(struct zone *zone, struct page *page,
 			continue;
 
 		add_to_free_list(current_buddy, zone, high, migratetype);
-		set_buddy_order(current_buddy, high);
+		set_buddy_order_mgen(current_buddy, high, 0);
 	}
 }
 
