@@ -229,6 +229,8 @@ enum flush_type {
 enum finalization_type {
 	FINALIZATION_TYPE_FINAL,	/* use final() */
 	FINALIZATION_TYPE_FINUP,	/* use finup() */
+	FINALIZATION_TYPE_FINUP2X_BUF1, /* use 1st buffer of finup2x() */
+	FINALIZATION_TYPE_FINUP2X_BUF2, /* use 2nd buffer of finup2x() */
 	FINALIZATION_TYPE_DIGEST,	/* use digest() */
 };
 
@@ -1111,14 +1113,23 @@ static void generate_random_testvec_config(struct rnd_state *rng,
 		p += scnprintf(p, end - p, " may_sleep");
 	}
 
-	switch (prandom_u32_below(rng, 4)) {
+	switch (prandom_u32_below(rng, 8)) {
 	case 0:
+	case 1:
 		cfg->finalization_type = FINALIZATION_TYPE_FINAL;
 		p += scnprintf(p, end - p, " use_final");
 		break;
-	case 1:
+	case 2:
 		cfg->finalization_type = FINALIZATION_TYPE_FINUP;
 		p += scnprintf(p, end - p, " use_finup");
+		break;
+	case 3:
+		cfg->finalization_type = FINALIZATION_TYPE_FINUP2X_BUF1;
+		p += scnprintf(p, end - p, " use_finup2x_buf1");
+		break;
+	case 4:
+		cfg->finalization_type = FINALIZATION_TYPE_FINUP2X_BUF2;
+		p += scnprintf(p, end - p, " use_finup2x_buf2");
 		break;
 	default:
 		cfg->finalization_type = FINALIZATION_TYPE_DIGEST;
@@ -1348,7 +1359,10 @@ static int test_shash_vec_cfg(const struct hash_testvec *vec,
 		goto result_ready;
 	}
 
-	/* Using init(), zero or more update(), then final() or finup() */
+	/*
+	 * Using init(), zero or more update(), then either final(), finup(), or
+	 * finup2x().
+	 */
 
 	if (cfg->nosimd)
 		crypto_disable_simd_for_test();
@@ -1360,24 +1374,46 @@ static int test_shash_vec_cfg(const struct hash_testvec *vec,
 		return err;
 
 	for (i = 0; i < tsgl->nents; i++) {
+		const u8 *data = sg_virt(&tsgl->sgl[i]);
+		unsigned int len = tsgl->sgl[i].length;
+
 		if (i + 1 == tsgl->nents &&
-		    cfg->finalization_type == FINALIZATION_TYPE_FINUP) {
+		    (cfg->finalization_type == FINALIZATION_TYPE_FINUP ||
+		     cfg->finalization_type == FINALIZATION_TYPE_FINUP2X_BUF1 ||
+		     cfg->finalization_type == FINALIZATION_TYPE_FINUP2X_BUF2)) {
+			const u8 *unused_data = tsgl->bufs[XBUFSIZE - 1];
+			u8 unused_result[HASH_MAX_DIGESTSIZE];
+			const char *op;
+
 			if (divs[i]->nosimd)
 				crypto_disable_simd_for_test();
-			err = crypto_shash_finup(desc, sg_virt(&tsgl->sgl[i]),
-						 tsgl->sgl[i].length, result);
+			if (cfg->finalization_type == FINALIZATION_TYPE_FINUP ||
+			    !crypto_shash_supports_finup2x(tfm)) {
+				err = crypto_shash_finup(desc, data, len,
+							 result);
+				op = "finup";
+			} else if (cfg->finalization_type ==
+				   FINALIZATION_TYPE_FINUP2X_BUF1) {
+				err = crypto_shash_finup2x(
+						desc, data, unused_data, len,
+						result, unused_result);
+				op = "finup2x_buf1";
+			} else { /* FINALIZATION_TYPE_FINUP2X_BUF2 */
+				err = crypto_shash_finup2x(
+						desc, unused_data, data, len,
+						unused_result, result);
+				op = "finup2x_buf2";
+			}
 			if (divs[i]->nosimd)
 				crypto_reenable_simd_for_test();
-			err = check_shash_op("finup", err, driver, vec_name,
-					     cfg);
+			err = check_shash_op(op, err, driver, vec_name, cfg);
 			if (err)
 				return err;
 			goto result_ready;
 		}
 		if (divs[i]->nosimd)
 			crypto_disable_simd_for_test();
-		err = crypto_shash_update(desc, sg_virt(&tsgl->sgl[i]),
-					  tsgl->sgl[i].length);
+		err = crypto_shash_update(desc, data, len);
 		if (divs[i]->nosimd)
 			crypto_reenable_simd_for_test();
 		err = check_shash_op("update", err, driver, vec_name, cfg);
