@@ -333,6 +333,11 @@ static void unregister_sha256_avx2(void)
 asmlinkage void sha256_ni_transform(struct sha256_state *digest,
 				    const u8 *data, int rounds);
 
+asmlinkage void __sha256_ni_finup2x(const struct sha256_state *sctx,
+				    const u8 *data1, const u8 *data2, int len,
+				    u8 out1[SHA256_DIGEST_SIZE],
+				    u8 out2[SHA256_DIGEST_SIZE]);
+
 static int sha256_ni_update(struct shash_desc *desc, const u8 *data,
 			 unsigned int len)
 {
@@ -357,6 +362,41 @@ static int sha256_ni_digest(struct shash_desc *desc, const u8 *data,
 	       sha256_ni_finup(desc, data, len, out);
 }
 
+static noinline_for_stack int
+sha256_finup2x_fallback(struct sha256_state *sctx, const u8 *data1,
+			const u8 *data2, unsigned int len, u8 *out1, u8 *out2)
+{
+	struct sha256_state sctx2 = *sctx;
+
+	sha256_update(sctx, data1, len);
+	sha256_final(sctx, out1);
+	sha256_update(&sctx2, data2, len);
+	sha256_final(&sctx2, out2);
+	return 0;
+}
+
+static int sha256_ni_finup2x(struct shash_desc *desc,
+			     const u8 *data1, const u8 *data2,
+			     unsigned int len, u8 *out1, u8 *out2)
+{
+	struct sha256_state *sctx = shash_desc_ctx(desc);
+
+	if (unlikely(!crypto_simd_usable() || len < SHA256_BLOCK_SIZE ||
+		     len > INT_MAX))
+		return sha256_finup2x_fallback(sctx, data1, data2, len,
+					       out1, out2);
+
+	/* __sha256_ni_finup2x() assumes the following offsets. */
+	BUILD_BUG_ON(offsetof(struct sha256_state, state) != 0);
+	BUILD_BUG_ON(offsetof(struct sha256_state, count) != 32);
+	BUILD_BUG_ON(offsetof(struct sha256_state, buf) != 40);
+
+	kernel_fpu_begin();
+	__sha256_ni_finup2x(sctx, data1, data2, len, out1, out2);
+	kernel_fpu_end();
+	return 0;
+}
+
 static struct shash_alg sha256_ni_algs[] = { {
 	.digestsize	=	SHA256_DIGEST_SIZE,
 	.init		=	sha256_base_init,
@@ -364,6 +404,7 @@ static struct shash_alg sha256_ni_algs[] = { {
 	.final		=	sha256_ni_final,
 	.finup		=	sha256_ni_finup,
 	.digest		=	sha256_ni_digest,
+	.finup2x	=	sha256_ni_finup2x,
 	.descsize	=	sizeof(struct sha256_state),
 	.base		=	{
 		.cra_name	=	"sha256",

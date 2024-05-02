@@ -200,6 +200,9 @@ struct shash_desc {
  * @export: see struct ahash_alg
  * @import: see struct ahash_alg
  * @setkey: see struct ahash_alg
+ * @finup2x: **[optional]** Finish calculating the digests of two equal-length
+ *	     messages, interleaving the instructions to potentially achieve
+ *	     better performance than hashing each message individually.
  * @init_tfm: Initialize the cryptographic transformation object.
  *	      This function is called only once at the instantiation
  *	      time, right after the transformation context was
@@ -231,6 +234,8 @@ struct shash_alg {
 	int (*import)(struct shash_desc *desc, const void *in);
 	int (*setkey)(struct crypto_shash *tfm, const u8 *key,
 		      unsigned int keylen);
+	int (*finup2x)(struct shash_desc *desc, const u8 *data1,
+		       const u8 *data2, unsigned int len, u8 *out1, u8 *out2);
 	int (*init_tfm)(struct crypto_shash *tfm);
 	void (*exit_tfm)(struct crypto_shash *tfm);
 	int (*clone_tfm)(struct crypto_shash *dst, struct crypto_shash *src);
@@ -773,6 +778,11 @@ static inline unsigned int crypto_shash_statesize(struct crypto_shash *tfm)
 	return crypto_shash_alg(tfm)->statesize;
 }
 
+static inline bool crypto_shash_supports_finup2x(struct crypto_shash *tfm)
+{
+	return crypto_shash_alg(tfm)->finup2x != NULL;
+}
+
 static inline u32 crypto_shash_get_flags(struct crypto_shash *tfm)
 {
 	return crypto_tfm_get_flags(crypto_shash_tfm(tfm));
@@ -865,6 +875,30 @@ int crypto_shash_digest(struct shash_desc *desc, const u8 *data,
  */
 int crypto_shash_tfm_digest(struct crypto_shash *tfm, const u8 *data,
 			    unsigned int len, u8 *out);
+
+/**
+ * crypto_shash_finup2x() - finish hashing two equal-length messages
+ * @desc: the hash state that will be forked for the two messages.  This
+ *	  contains the state after hashing a (possibly-empty) common prefix of
+ *	  the two messages.
+ * @data1: the first message (not including any common prefix from @desc)
+ * @data2: the second message (not including any common prefix from @desc)
+ * @len: length of @data1 and @data2 in bytes
+ * @out1: output buffer for first message digest
+ * @out2: output buffer for second message digest
+ *
+ * Users must check crypto_shash_supports_finup2x(tfm) before calling this.
+ *
+ * Context: Any context.
+ * Return: 0 on success; a negative errno value on failure.
+ */
+static inline int crypto_shash_finup2x(struct shash_desc *desc,
+				       const u8 *data1, const u8 *data2,
+				       unsigned int len, u8 *out1, u8 *out2)
+{
+	return crypto_shash_alg(desc->tfm)->finup2x(desc, data1, data2, len,
+						    out1, out2);
+}
 
 /**
  * crypto_shash_export() - extract operational state for message digest
