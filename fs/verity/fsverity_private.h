@@ -29,6 +29,7 @@ struct fsverity_hash_alg {
 	 * FS_VERITY_HASH_ALG_*, which uses a different numbering scheme.
 	 */
 	enum hash_algo algo_id;
+	bool supports_multibuffer;  /* crypto_shash_mb_max_msgs(tfm) >= 2 */
 };
 
 /* Merkle tree parameters: hash algorithm, initial hash state, and topology */
@@ -67,6 +68,7 @@ struct fsverity_info {
 	struct merkle_tree_params tree_params;
 	u8 root_hash[FS_VERITY_MAX_DIGEST_SIZE];
 	u8 file_digest[FS_VERITY_MAX_DIGEST_SIZE];
+	u8 zero_block_hash[FS_VERITY_MAX_DIGEST_SIZE];
 	const struct inode *inode;
 	unsigned long *hash_block_verified;
 };
@@ -84,6 +86,9 @@ const u8 *fsverity_prepare_hash_state(const struct fsverity_hash_alg *alg,
 				      const u8 *salt, size_t salt_size);
 int fsverity_hash_block(const struct merkle_tree_params *params,
 			const struct inode *inode, const void *data, u8 *out);
+int fsverity_hash_2_blocks(const struct merkle_tree_params *params,
+			   const struct inode *inode, const void *data1,
+			   const void *data2, u8 *out1, u8 *out2);
 int fsverity_hash_buffer(const struct fsverity_hash_alg *alg,
 			 const void *data, size_t size, u8 *out);
 void __init fsverity_check_hash_algs(void);
