@@ -911,22 +911,15 @@ void __init create_kmalloc_caches(slab_flags_t flags)
 	 * Including KMALLOC_CGROUP if CONFIG_MEMCG_KMEM defined
 	 */
 	for (type = KMALLOC_NORMAL; type < NR_KMALLOC_TYPES; type++) {
-		for (i = KMALLOC_SHIFT_LOW; i <= KMALLOC_SHIFT_HIGH; i++) {
-			if (!kmalloc_caches[type][i])
-				new_kmalloc_cache(i, type, flags);
+		/* Caches that are NOT of the two-to-the-power-of size. */
+		if (KMALLOC_MIN_SIZE <= 32)
+			new_kmalloc_cache(1, type, flags);
+		if (KMALLOC_MIN_SIZE <= 64)
+			new_kmalloc_cache(2, type, flags);
 
-			/*
-			 * Caches that are not of the two-to-the-power-of size.
-			 * These have to be created immediately after the
-			 * earlier power of two caches
-			 */
-			if (KMALLOC_MIN_SIZE <= 32 && i == 6 &&
-					!kmalloc_caches[type][1])
-				new_kmalloc_cache(1, type, flags);
-			if (KMALLOC_MIN_SIZE <= 64 && i == 7 &&
-					!kmalloc_caches[type][2])
-				new_kmalloc_cache(2, type, flags);
-		}
+		/* Caches that are of the two-to-the-power-of size. */
+		for (i = KMALLOC_SHIFT_LOW; i <= KMALLOC_SHIFT_HIGH; i++)
+			new_kmalloc_cache(i, type, flags);
 	}
 #ifdef CONFIG_RANDOM_KMALLOC_CACHES
 	random_kmalloc_seed = get_random_u64();
