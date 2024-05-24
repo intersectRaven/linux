@@ -400,6 +400,7 @@
  * 7. WPTR_ADDR_HI [31:0]
  */
 /* CONTROL */
+#              define PACKET3_MAP_QUEUES_EXTENDED_ENGINE_SEL(x) ((x) << 2)
 #              define PACKET3_MAP_QUEUES_QUEUE_SEL(x)       ((x) << 4)
 #              define PACKET3_MAP_QUEUES_VMID(x)            ((x) << 8)
 #              define PACKET3_MAP_QUEUES_QUEUE(x)           ((x) << 13)
@@ -427,6 +428,7 @@
 		 * 2 - DISABLE_PROCESS_QUEUES
 		 * 3 - PREEMPT_QUEUES_NO_UNMAP
 		 */
+#              define PACKET3_UNMAP_QUEUES_EXTENDED_ENGINE_SEL(x) ((x) << 2)
 #              define PACKET3_UNMAP_QUEUES_QUEUE_SEL(x)        ((x) << 4)
 #              define PACKET3_UNMAP_QUEUES_ENGINE_SEL(x)       ((x) << 26)
 #              define PACKET3_UNMAP_QUEUES_NUM_QUEUES(x)       ((x) << 29)

@@ -3611,25 +3611,58 @@ static void gfx10_kiq_map_queues(struct amdgpu_ring *kiq_ring,
 {
 	uint64_t mqd_addr = amdgpu_bo_gpu_offset(ring->mqd_obj);
 	uint64_t wptr_addr = ring->wptr_gpu_addr;
-	uint32_t eng_sel = 0;
+	uint32_t eng_sel, ext_eng_sel;
 
-	switch (ring->funcs->type) {
-	case AMDGPU_RING_TYPE_COMPUTE:
-		eng_sel = 0;
-		break;
-	case AMDGPU_RING_TYPE_GFX:
-		eng_sel = 4;
-		break;
-	case AMDGPU_RING_TYPE_MES:
-		eng_sel = 5;
-		break;
-	default:
-		WARN_ON(1);
+	if (amdgpu_ip_version(kiq_ring->adev, GC_HWIP, 0) < IP_VERSION(10, 3, 0)) {
+		ext_eng_sel = 0;
+		switch (ring->funcs->type) {
+		case AMDGPU_RING_TYPE_COMPUTE:
+			eng_sel = 0;
+			break;
+		case AMDGPU_RING_TYPE_GFX:
+			eng_sel = 4;
+			break;
+		case AMDGPU_RING_TYPE_MES:
+			eng_sel = 5;
+			break;
+		case AMDGPU_RING_TYPE_SDMA:
+			eng_sel = 2 + ring->me;
+			break;
+		default:
+			eng_sel = 0;
+			WARN_ON(1);
+			break;
+		}
+	} else {
+		switch (ring->funcs->type) {
+		case AMDGPU_RING_TYPE_COMPUTE:
+			ext_eng_sel = 0;
+			eng_sel = 0;
+			break;
+		case AMDGPU_RING_TYPE_GFX:
+			ext_eng_sel = 0;
+			eng_sel = 4;
+			break;
+		case AMDGPU_RING_TYPE_MES:
+			ext_eng_sel = 0;
+			eng_sel = 5;
+			break;
+		case AMDGPU_RING_TYPE_SDMA:
+			ext_eng_sel = 1;
+			eng_sel = ring->me;
+			break;
+		default:
+			eng_sel = 0;
+			ext_eng_sel = 0;
+			WARN_ON(1);
+			break;
+		}
 	}
 
 	amdgpu_ring_write(kiq_ring, PACKET3(PACKET3_MAP_QUEUES, 5));
 	/* Q_sel:0, vmid:0, vidmem: 1, engine:0, num_Q:1*/
 	amdgpu_ring_write(kiq_ring, /* Q_sel: 0, vmid: 0, engine: 0, num_Q: 1 */
+			  PACKET3_MAP_QUEUES_EXTENDED_ENGINE_SEL(ext_eng_sel) |
 			  PACKET3_MAP_QUEUES_QUEUE_SEL(0) | /* Queue_Sel */
 			  PACKET3_MAP_QUEUES_VMID(0) | /* VMID */
 			  PACKET3_MAP_QUEUES_QUEUE(ring->queue) |
@@ -3652,7 +3685,30 @@ static void gfx10_kiq_unmap_queues(struct amdgpu_ring *kiq_ring,
 				   u64 gpu_addr, u64 seq)
 {
 	struct amdgpu_device *adev = kiq_ring->adev;
-	uint32_t eng_sel = ring->funcs->type == AMDGPU_RING_TYPE_GFX ? 4 : 0;
+	uint32_t eng_sel, ext_eng_sel;
+
+	if (amdgpu_ip_version(kiq_ring->adev, GC_HWIP, 0) < IP_VERSION(10, 3, 0)) {
+		ext_eng_sel = 0;
+		if (ring->funcs->type == AMDGPU_RING_TYPE_GFX)
+			eng_sel = 4;
+		else if (ring->funcs->type == AMDGPU_RING_TYPE_COMPUTE)
+			eng_sel = 0;
+		else
+			/* SDMA */
+			eng_sel = 2 + ring->me;
+	} else {
+		if (ring->funcs->type == AMDGPU_RING_TYPE_GFX) {
+			ext_eng_sel = 0;
+			eng_sel = 4;
+		} else if (ring->funcs->type == AMDGPU_RING_TYPE_COMPUTE) {
+			ext_eng_sel = 0;
+			eng_sel = 0;
+		} else {
+			/* SDMA */
+			ext_eng_sel = 1;
+			eng_sel = ring->me;
+		}
+	}
 
 	if (adev->enable_mes && !adev->gfx.kiq[0].ring.sched.ready) {
 		amdgpu_mes_unmap_legacy_queue(adev, ring, action, gpu_addr, seq);
@@ -3662,6 +3718,7 @@ static void gfx10_kiq_unmap_queues(struct amdgpu_ring *kiq_ring,
 	amdgpu_ring_write(kiq_ring, PACKET3(PACKET3_UNMAP_QUEUES, 4));
 	amdgpu_ring_write(kiq_ring, /* Q_sel: 0, vmid: 0, engine: 0, num_Q: 1 */
 			  PACKET3_UNMAP_QUEUES_ACTION(action) |
+			  PACKET3_UNMAP_QUEUES_EXTENDED_ENGINE_SEL(ext_eng_sel) |
 			  PACKET3_UNMAP_QUEUES_QUEUE_SEL(0) |
 			  PACKET3_UNMAP_QUEUES_ENGINE_SEL(eng_sel) |
 			  PACKET3_UNMAP_QUEUES_NUM_QUEUES(1));
