@@ -79,7 +79,10 @@ static bool is_hash_block_verified(struct fsverity_info *vi, struct page *hpage,
 }
 
 /*
- * Verify a single data block against the file's Merkle tree.
+ * Verify the hash of a single data block against the file's Merkle tree.
+ *
+ * @real_dblock_hash specifies the hash of the data block, and @data_pos
+ * specifies the byte position of the data block within the file.
  *
  * In principle, we need to verify the entire path to the root node.  However,
  * for efficiency the filesystem may cache the hash blocks.  Therefore we need
@@ -90,14 +93,15 @@ static bool is_hash_block_verified(struct fsverity_info *vi, struct page *hpage,
  */
 static bool
 verify_data_block(struct inode *inode, struct fsverity_info *vi,
-		  const void *data, u64 data_pos, unsigned long max_ra_pages)
+		  const u8 *real_dblock_hash, u64 data_pos,
+		  unsigned long max_ra_pages)
 {
 	const struct merkle_tree_params *params = &vi->tree_params;
 	const unsigned int hsize = params->digest_size;
 	int level;
 	u8 _want_hash[FS_VERITY_MAX_DIGEST_SIZE];
 	const u8 *want_hash;
-	u8 real_hash[FS_VERITY_MAX_DIGEST_SIZE];
+	u8 real_hblock_hash[FS_VERITY_MAX_DIGEST_SIZE];
 	/* The hash blocks that are traversed, indexed by level */
 	struct {
 		/* Page containing the hash block */
@@ -127,7 +131,8 @@ verify_data_block(struct inode *inode, struct fsverity_info *vi,
 		 * any part past EOF should be all zeroes.  Therefore, we need
 		 * to verify that any data blocks fully past EOF are all zeroes.
 		 */
-		if (memchr_inv(data, 0, params->block_size)) {
+		if (memcmp(vi->zero_block_hash, real_dblock_hash,
+			   params->block_size) != 0) {
 			fsverity_err(inode,
 				     "FILE CORRUPTED!  Data past EOF is not zeroed");
 			return false;
@@ -202,9 +207,10 @@ descend:
 		unsigned long hblock_idx = hblocks[level - 1].index;
 		unsigned int hoffset = hblocks[level - 1].hoffset;
 
-		if (fsverity_hash_block(params, inode, haddr, real_hash) != 0)
+		if (fsverity_hash_block(params, inode, haddr,
+					real_hblock_hash) != 0)
 			goto error;
-		if (memcmp(want_hash, real_hash, hsize) != 0)
+		if (memcmp(want_hash, real_hblock_hash, hsize) != 0)
 			goto corrupted;
 		/*
 		 * Mark the hash block as verified.  This must be atomic and
@@ -221,10 +227,8 @@ descend:
 		put_page(hpage);
 	}
 
-	/* Finally, verify the data block. */
-	if (fsverity_hash_block(params, inode, data, real_hash) != 0)
-		goto error;
-	if (memcmp(want_hash, real_hash, hsize) != 0)
+	/* Finally, verify the hash of the data block. */
+	if (memcmp(want_hash, real_dblock_hash, hsize) != 0)
 		goto corrupted;
 	return true;
 
@@ -233,7 +237,8 @@ corrupted:
 		     "FILE CORRUPTED! pos=%llu, level=%d, want_hash=%s:%*phN, real_hash=%s:%*phN",
 		     data_pos, level - 1,
 		     params->hash_alg->name, hsize, want_hash,
-		     params->hash_alg->name, hsize, real_hash);
+		     params->hash_alg->name, hsize,
+		     level == 0 ? real_dblock_hash : real_hblock_hash);
 error:
 	for (; level > 0; level--) {
 		kunmap_local(hblocks[level - 1].addr);
@@ -242,14 +247,76 @@ error:
 	return false;
 }
 
-static bool
-verify_data_blocks(struct folio *data_folio, size_t len, size_t offset,
-		   unsigned long max_ra_pages)
+struct fsverity_verification_context {
+	struct inode *inode;
+	struct fsverity_info *vi;
+	unsigned long max_ra_pages;
+
+	/*
+	 * pending_data and pending_pos are used when the selected hash
+	 * algorithm supports multibuffer hashing.  They're used to temporarily
+	 * store the virtual address and position of a mapped data block that
+	 * needs to be verified.  If we then see another data block, we hash the
+	 * two blocks simultaneously using the fast multibuffer hashing method.
+	 */
+	const void *pending_data;
+	u64 pending_pos;
+
+	/* Buffers to temporarily store the calculated data block hashes */
+	u8 hash1[FS_VERITY_MAX_DIGEST_SIZE];
+	u8 hash2[FS_VERITY_MAX_DIGEST_SIZE];
+};
+
+static inline void
+fsverity_init_verification_context(struct fsverity_verification_context *ctx,
+				   struct inode *inode,
+				   unsigned long max_ra_pages)
 {
-	struct inode *inode = data_folio->mapping->host;
-	struct fsverity_info *vi = inode->i_verity_info;
-	const unsigned int block_size = vi->tree_params.block_size;
-	u64 pos = (u64)data_folio->index << PAGE_SHIFT;
+	ctx->inode = inode;
+	ctx->vi = inode->i_verity_info;
+	ctx->max_ra_pages = max_ra_pages;
+	ctx->pending_data = NULL;
+}
+
+static bool
+fsverity_finish_verification(struct fsverity_verification_context *ctx)
+{
+	int err;
+
+	if (ctx->pending_data == NULL)
+		return true;
+	/*
+	 * Multibuffer hashing is enabled but there was an odd number of data
+	 * blocks.  Hash and verify the last block by itself.
+	 */
+	err = fsverity_hash_block(&ctx->vi->tree_params, ctx->inode,
+				  ctx->pending_data, ctx->hash1);
+	kunmap_local(ctx->pending_data);
+	ctx->pending_data = NULL;
+	return err == 0 &&
+	       verify_data_block(ctx->inode, ctx->vi, ctx->hash1,
+				 ctx->pending_pos, ctx->max_ra_pages);
+}
+
+static inline void
+fsverity_abort_verification(struct fsverity_verification_context *ctx)
+{
+	if (ctx->pending_data) {
+		kunmap_local(ctx->pending_data);
+		ctx->pending_data = NULL;
+	}
+}
+
+static bool
+fsverity_add_data_blocks(struct fsverity_verification_context *ctx,
+			 struct folio *data_folio, size_t len, size_t offset)
+{
+	struct inode *inode = ctx->inode;
+	struct fsverity_info *vi = ctx->vi;
+	const struct merkle_tree_params *params = &vi->tree_params;
+	const unsigned int block_size = params->block_size;
+	const bool multibuffer = params->hash_alg->supports_multibuffer;
+	u64 pos = ((u64)data_folio->index << PAGE_SHIFT) + offset;
 
 	if (WARN_ON_ONCE(len <= 0 || !IS_ALIGNED(len | offset, block_size)))
 		return false;
@@ -257,15 +324,44 @@ verify_data_blocks(struct folio *data_folio, size_t len, size_t offset,
 			 folio_test_uptodate(data_folio)))
 		return false;
 	do {
-		void *data;
-		bool valid;
+		const void *data = kmap_local_folio(data_folio, offset);
+		int err;
 
-		data = kmap_local_folio(data_folio, offset);
-		valid = verify_data_block(inode, vi, data, pos + offset,
-					  max_ra_pages);
-		kunmap_local(data);
-		if (!valid)
-			return false;
+		if (multibuffer) {
+			if (ctx->pending_data) {
+				/* Hash and verify two data blocks. */
+				err = fsverity_hash_2_blocks(params,
+							     inode,
+							     ctx->pending_data,
+							     data,
+							     ctx->hash1,
+							     ctx->hash2);
+				kunmap_local(data);
+				kunmap_local(ctx->pending_data);
+				ctx->pending_data = NULL;
+				if (err != 0 ||
+				    !verify_data_block(inode, vi, ctx->hash1,
+						       ctx->pending_pos,
+						       ctx->max_ra_pages) ||
+				    !verify_data_block(inode, vi, ctx->hash2,
+						       pos, ctx->max_ra_pages))
+					return false;
+			} else {
+				/* Wait and see if there's another block. */
+				ctx->pending_data = data;
+				ctx->pending_pos = pos;
+			}
+		} else {
+			/* Hash and verify one data block. */
+			err = fsverity_hash_block(params, inode, data,
+						  ctx->hash1);
+			kunmap_local(data);
+			if (err != 0 ||
+			    !verify_data_block(inode, vi, ctx->hash1,
+					       pos, ctx->max_ra_pages))
+				return false;
+		}
+		pos += block_size;
 		offset += block_size;
 		len -= block_size;
 	} while (len);
@@ -286,7 +382,15 @@ verify_data_blocks(struct folio *data_folio, size_t len, size_t offset,
  */
 bool fsverity_verify_blocks(struct folio *folio, size_t len, size_t offset)
 {
-	return verify_data_blocks(folio, len, offset, 0);
+	struct fsverity_verification_context ctx;
+
+	fsverity_init_verification_context(&ctx, folio->mapping->host, 0);
+
+	if (!fsverity_add_data_blocks(&ctx, folio, len, offset)) {
+		fsverity_abort_verification(&ctx);
+		return false;
+	}
+	return fsverity_finish_verification(&ctx);
 }
 EXPORT_SYMBOL_GPL(fsverity_verify_blocks);
 
@@ -307,6 +411,8 @@ EXPORT_SYMBOL_GPL(fsverity_verify_blocks);
  */
 void fsverity_verify_bio(struct bio *bio)
 {
+	struct inode *inode = bio_first_folio_all(bio)->mapping->host;
+	struct fsverity_verification_context ctx;
 	struct folio_iter fi;
 	unsigned long max_ra_pages = 0;
 
@@ -323,13 +429,22 @@ void fsverity_verify_bio(struct bio *bio)
 		max_ra_pages = bio->bi_iter.bi_size >> (PAGE_SHIFT + 2);
 	}
 
+	fsverity_init_verification_context(&ctx, inode, max_ra_pages);
+
 	bio_for_each_folio_all(fi, bio) {
-		if (!verify_data_blocks(fi.folio, fi.length, fi.offset,
-					max_ra_pages)) {
-			bio->bi_status = BLK_STS_IOERR;
-			break;
+		if (!fsverity_add_data_blocks(&ctx, fi.folio, fi.length,
+					      fi.offset)) {
+			fsverity_abort_verification(&ctx);
+			goto ioerr;
 		}
 	}
+
+	if (!fsverity_finish_verification(&ctx))
+		goto ioerr;
+	return;
+
+ioerr:
+	bio->bi_status = BLK_STS_IOERR;
 }
 EXPORT_SYMBOL_GPL(fsverity_verify_bio);
 #endif /* CONFIG_BLOCK */
