@@ -138,6 +138,10 @@ struct kiq_pm4_funcs {
 	void (*kiq_invalidate_tlbs)(struct amdgpu_ring *kiq_ring,
 				uint16_t pasid, uint32_t flush_type,
 				bool all_hub);
+	void (*kiq_reset_hw_queue)(struct amdgpu_ring *kiq_ring,
+				   uint32_t queue_type, uint32_t me_id,
+				   uint32_t pipe_id, uint32_t queue_id,
+				   uint32_t xcc_id, uint32_t vmid);
 	/* Packet sizes */
 	int set_resources_size;
 	int map_queues_size;
@@ -437,6 +441,8 @@ struct amdgpu_gfx {
 	/* IP reg dump */
 	uint32_t			*ip_dump;
 	uint32_t			reg_count;
+
+	struct mutex			reset_sem_mutex;
 };
 
 struct amdgpu_gfx_ras_reg_entry {
