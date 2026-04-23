@@ -68,6 +68,10 @@ struct sched_domain_shared {
 	atomic_t	nr_busy_cpus;
 	int		has_idle_cores;
 	int		nr_idle_scan;
+#ifdef CONFIG_SCHED_CACHE
+	unsigned long	util_avg;
+	unsigned long	capacity;
+#endif
 };
 
 struct sched_domain {
@@ -97,6 +101,19 @@ struct sched_domain {
 	unsigned int newidle_ratio;
 	u64 max_newidle_lb_cost;
 	unsigned long last_decay_max_lb_cost;
+
+#ifdef CONFIG_SCHED_CACHE
+	unsigned int llc_max;
+	/*
+	 * per LLC preference counter
+	 * __counted_by cannot be used here because
+	 * when the percpu sched_domain is being allocated,
+	 * llc_max is unknown, and thus the actual size
+	 * of the sched_domain(including the llc_counts elements)
+	 * is undetermined.
+	 */
+	unsigned int *llc_counts;
+#endif
 
 #ifdef CONFIG_SCHEDSTATS
 	/* sched_balance_rq() stats */
