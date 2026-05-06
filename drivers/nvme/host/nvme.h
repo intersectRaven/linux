@@ -640,6 +640,9 @@ struct nvme_ctrl_ops {
 	void (*print_device_info)(struct nvme_ctrl *ctrl);
 	bool (*supports_pci_p2pdma)(struct nvme_ctrl *ctrl);
 	unsigned long (*get_virt_boundary)(struct nvme_ctrl *ctrl, bool is_admin);
+
+	/* return device for DMA mappings */
+	struct device *(*dma_dev)(struct nvme_ctrl *ctrl);
 };
 
 /*
@@ -857,7 +860,9 @@ static __always_inline void nvme_complete_batch(struct io_comp_batch *iob,
 	struct request *req;
 
 	rq_list_for_each(&iob->req_list, req) {
-		fn(req);
+		/* No need to call unmap for RQF_REGISTERED */
+		if (!(req->rq_flags & RQF_REGISTERED))
+			fn(req);
 		nvme_complete_batch_req(req);
 	}
 	blk_mq_end_request_batch(iob);
