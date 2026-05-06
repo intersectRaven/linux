@@ -892,6 +892,36 @@ end_io:
 }
 EXPORT_SYMBOL(submit_bio_noacct);
 
+/**
+ * submit_bio_noacct_fast - submit a pre-validated registered slot bio
+ * @bio: bio carrying BIO_REGISTERED, owned by an io_uring io_slot
+ */
+void submit_bio_noacct_fast(struct bio *bio)
+{
+	if (WARN_ON_ONCE(!bio_flagged(bio, BIO_REGISTERED))) {
+		submit_bio_noacct(bio);
+		return;
+	}
+
+	if (unlikely(bio_check_eod(bio))) {
+		bio->bi_status = BLK_STS_IOERR;
+		bio_endio(bio);
+		return;
+	}
+
+	if (!bio_flagged(bio, BIO_TRACE_COMPLETION)) {
+		trace_block_bio_queue(bio);
+		bio_set_flag(bio, BIO_TRACE_COMPLETION);
+	}
+
+	/*
+	 * Slot validation guaranteed BD_HAS_SUBMIT_BIO is clear, so we go
+	 * straight to blk_mq_submit_bio - no bio_list dance, no recursion.
+	 */
+	__submit_bio(bio);
+}
+EXPORT_SYMBOL(submit_bio_noacct_fast);
+
 static void bio_set_ioprio(struct bio *bio)
 {
 	/* Nobody set ioprio so far? Initialize it based on task's nice value */
