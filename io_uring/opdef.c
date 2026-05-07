@@ -17,6 +17,7 @@
 #include "fdinfo.h"
 #include "kbuf.h"
 #include "rsrc.h"
+#include "slot.h"
 
 #include "xattr.h"
 #include "nop.h"
@@ -589,6 +590,17 @@ const struct io_issue_def io_issue_defs[] = {
 		.prep			= io_uring_cmd_prep,
 		.issue			= io_uring_cmd,
 	},
+	[IORING_OP_SLOT_RW] = {
+		.audit_skip		= 1,
+		.iopoll			= 1,
+		.plug			= 1,
+#if defined(CONFIG_IO_URING_SLOT_RW)
+		.prep			= io_slot_rw_prep,
+		.issue			= io_slot_rw,
+#else
+		.prep			= io_eopnotsupp_prep,
+#endif
+	},
 };
 
 const struct io_cold_def io_cold_defs[] = {
@@ -846,6 +858,9 @@ const struct io_cold_def io_cold_defs[] = {
 		.name			= "URING_CMD128",
 		.sqe_copy		= io_uring_cmd_sqe_copy,
 		.cleanup		= io_uring_cmd_cleanup,
+	},
+	[IORING_OP_SLOT_RW] = {
+		.name			= "SLOT_RW",
 	},
 };
 

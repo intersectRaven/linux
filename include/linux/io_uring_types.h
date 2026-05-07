@@ -268,6 +268,11 @@ struct io_alloc_cache {
 	unsigned int		init_clear;
 };
 
+struct io_slot_table {
+	struct io_slot		**slots;
+	unsigned int		nr_slots;
+};
+
 struct io_ring_ctx {
 	/* const or read-mostly hot data */
 	struct {
@@ -337,6 +342,7 @@ struct io_ring_ctx {
 
 		struct io_file_table	file_table;
 		struct io_rsrc_data	buf_table;
+		struct io_slot_table	slot_table;
 		struct io_alloc_cache	node_cache;
 		struct io_alloc_cache	imu_cache;
 
