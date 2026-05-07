@@ -1074,27 +1074,8 @@ static int io_import_fixed(int ddir, struct iov_iter *iter,
 	if (imu->flags & IO_REGBUF_F_KBUF)
 		return io_import_kbuf(ddir, iter, imu, len, offset);
 
-	/*
-	 * Don't use iov_iter_advance() here, as it's really slow for
-	 * using the latter parts of a big fixed buffer - it iterates
-	 * over each segment manually. We can cheat a bit here for user
-	 * registered nodes, because we know that:
-	 *
-	 * 1) it's a BVEC iter, we set it up
-	 * 2) all bvecs are the same in size, except potentially the
-	 *    first and last bvec
-	 */
 	folio_mask = (1UL << imu->folio_shift) - 1;
-	bvec = imu->bvec;
-	if (offset >= bvec->bv_len) {
-		unsigned long seg_skip;
-
-		/* skip first vec */
-		offset -= bvec->bv_len;
-		seg_skip = 1 + (offset >> imu->folio_shift);
-		bvec += seg_skip;
-		offset &= folio_mask;
-	}
+	bvec = io_imu_offset_to_bvec(imu, &offset);
 	nr_segs = (offset + len + bvec->bv_offset + folio_mask) >> imu->folio_shift;
 	iov_iter_bvec(iter, ddir, bvec, nr_segs, len);
 	iter->iov_offset = offset;
