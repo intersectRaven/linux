@@ -51,6 +51,20 @@ static inline bool bio_flagged(const struct bio *bio, unsigned int bit)
 	return bio->bi_flags & (1U << bit);
 }
 
+/*
+ * For BIO_REGISTERED bios, bi_private holds a pointer to the persistent
+ * io_slot_dma state.
+ *
+ * Returns NULL for bios that aren't part of a registered slot, in which
+ * case the driver should fall back to the regular dma map path.
+ */
+static inline struct io_slot_dma *bio_persistent_dma(const struct bio *bio)
+{
+	if (!bio_flagged(bio, BIO_REGISTERED))
+		return NULL;
+	return bio->bi_private;
+}
+
 static inline void bio_set_flag(struct bio *bio, unsigned int bit)
 {
 	bio->bi_flags |= (1U << bit);
