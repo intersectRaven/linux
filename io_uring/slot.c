@@ -18,6 +18,7 @@
 #include <linux/bio.h>
 #include <linux/blkdev.h>
 #include <linux/nospec.h>
+#include <linux/overflow.h>
 
 #include <uapi/linux/io_uring.h>
 
@@ -31,7 +32,10 @@ struct io_slot {
 	struct io_rsrc_node	*buf_node;
 	struct io_rsrc_node	*file_node;
 
+	/* Whole-disk bdev; partition is folded into part_offset / part_size */
 	struct block_device	*bdev;
+	u64			part_offset;	/* bytes; 0 for whole-disk */
+	u64			part_size;	/* bytes; bdev_nr_sectors at register */
 
 	/* Set to a valid request when the slot is currently undergoing IO */
 	struct io_kiocb		*req;
@@ -187,16 +191,7 @@ static struct block_device *io_slot_validate_file(struct file *file)
 	if (!bdev)
 		return ERR_PTR(-EINVAL);
 
-	/*
-	 * Partitions would need bd_start_sect folded into bi_sector at
-	 * submit time (or a remap step), and we explicitly skip
-	 * blk_partition_remap() in submit_bio_noacct_fast(). Reject for
-	 * now.
-	 */
-	if (bdev_is_partition(bdev))
-		return ERR_PTR(-EOPNOTSUPP);
-
-	if (bdev_test_flag(bdev, BD_HAS_SUBMIT_BIO))
+	if (bdev_test_flag(bdev_whole(bdev), BD_HAS_SUBMIT_BIO))
 		return ERR_PTR(-EOPNOTSUPP);
 
 	return bdev;
@@ -253,10 +248,13 @@ int io_register_io_slot(struct io_ring_ctx *ctx, void __user *arg)
 
 	slot->buf_node = buf_node;
 	slot->file_node = file_node;
-	slot->bdev = bdev;
+
+	slot->bdev = bdev_whole(bdev);
+	slot->part_offset = bdev->bd_start_sect << SECTOR_SHIFT;
+	slot->part_size = bdev_nr_sectors(bdev) << SECTOR_SHIFT;
 
 	/* Upfront init of the bio */
-	bio_init(&slot->bio, bdev, imu->bvec, imu->nr_bvecs, REQ_OP_READ);
+	bio_init(&slot->bio, slot->bdev, imu->bvec, imu->nr_bvecs, REQ_OP_READ);
 	slot->bio.bi_end_io = io_slot_bio_end_io;
 	bio_set_flag(&slot->bio, BIO_REGISTERED);
 
@@ -326,6 +324,7 @@ static int io_slot_submit(struct io_ring_ctx *ctx, struct io_kiocb *req,
 	blk_opf_t opf;
 	const struct bio_vec *bvec;
 	size_t walk;
+	u64 end;
 
 	io_ring_submit_lock(ctx, issue_flags);
 
@@ -334,7 +333,18 @@ static int io_slot_submit(struct io_ring_ctx *ctx, struct io_kiocb *req,
 		goto err;
 
 	imu = slot->buf_node->buf;
-	if (rw->buf_off + rw->nbytes > imu->len)
+	/*
+	 * Check both ends in u64 so a sector-aligned offset close to U64_MAX
+	 * can't wrap rw->{buf_off,offset} + rw->nbytes back into a small
+	 * value that passes the bounds test.
+	 */
+	if (check_add_overflow(rw->buf_off, (u64)rw->nbytes, &end) ||
+	    end > imu->len)
+		goto err;
+	if (check_add_overflow(rw->offset, (u64)rw->nbytes, &end) ||
+	    end > slot->part_size)
+		goto err;
+	if (check_add_overflow(slot->part_offset, rw->offset, &end))
 		goto err;
 
 	walk = rw->buf_off;
@@ -356,7 +366,7 @@ static int io_slot_submit(struct io_ring_ctx *ctx, struct io_kiocb *req,
 		opf |= REQ_POLLED;
 	bio->bi_opf = opf | REQ_NOMERGE;
 
-	bio->bi_iter.bi_sector = rw->offset >> SECTOR_SHIFT;
+	bio->bi_iter.bi_sector = (slot->part_offset + rw->offset) >> SECTOR_SHIFT;
 	bio->bi_iter.bi_size = rw->nbytes;
 	bio->bi_iter.bi_idx = bvec - imu->bvec;
 	bio->bi_iter.bi_bvec_done = walk;
