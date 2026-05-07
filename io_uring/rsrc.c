@@ -111,13 +111,22 @@ static void io_release_ubuf(void *priv)
 static struct io_mapped_ubuf *io_alloc_imu(struct io_ring_ctx *ctx,
 					   int nr_bvecs)
 {
+	struct io_mapped_ubuf *imu;
+
 	if (nr_bvecs <= IO_CACHED_BVECS_SEGS)
-		return io_cache_alloc(&ctx->imu_cache, GFP_KERNEL);
-	return kvmalloc_flex(struct io_mapped_ubuf, bvec, nr_bvecs);
+		imu = io_cache_alloc(&ctx->imu_cache, GFP_KERNEL);
+	else
+		imu = kvmalloc_flex(struct io_mapped_ubuf, bvec, nr_bvecs);
+	if (imu)
+		INIT_LIST_HEAD(&imu->dma_mappings);
+	return imu;
 }
 
 static void io_free_imu(struct io_ring_ctx *ctx, struct io_mapped_ubuf *imu)
 {
+	/* Slots pin buf_node which pins imu, "can't happen" scenario */
+	WARN_ON_ONCE(!list_empty(&imu->dma_mappings));
+
 	if (imu->nr_bvecs <= IO_CACHED_BVECS_SEGS)
 		io_cache_free(&ctx->imu_cache, imu);
 	else
