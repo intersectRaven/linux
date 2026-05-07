@@ -39,6 +39,12 @@ struct io_mapped_ubuf {
 	u8		dir;
 	void		(*release)(void *);
 	void		*priv;
+	/*
+	 * persistent DMA mappings of this buffer, one for each dma_dev
+	 * mapped, if any. Added on first slot registration of this buffer.
+	 */
+	struct list_head dma_mappings;
+
 	struct bio_vec	bvec[] __counted_by(nr_bvecs);
 };
 
