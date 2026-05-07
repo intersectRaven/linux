@@ -2,6 +2,7 @@
 #define IO_URING_TYPES_H
 
 #include <linux/blk_plug.h>
+#include <linux/blk_types.h>
 #include <linux/hashtable.h>
 #include <linux/task_work.h>
 #include <linux/bitmap.h>
@@ -307,6 +308,11 @@ struct io_alloc_cache {
 	unsigned int		init_clear;
 };
 
+struct io_slot_table {
+	struct io_slot		**slots;
+	unsigned int		nr_slots;
+};
+
 enum {
 	IO_RING_F_DRAIN_NEXT		= BIT(0),
 	IO_RING_F_OP_RESTRICTED		= BIT(1),
@@ -394,6 +400,7 @@ struct io_ring_ctx {
 
 		struct io_file_table	file_table;
 		struct io_rsrc_data	buf_table;
+		struct io_slot_table	slot_table;
 		struct io_alloc_cache	node_cache;
 		struct io_alloc_cache	imu_cache;
 
