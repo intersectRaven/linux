@@ -23,6 +23,7 @@
 #include "opdef.h"
 #include "tctx.h"
 #include "rsrc.h"
+#include "slot.h"
 #include "sqpoll.h"
 #include "register.h"
 #include "cancel.h"
@@ -957,6 +958,18 @@ static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
 		if (!ret)
 			WRITE_ONCE(ctx->bpf_filters,
 				   ctx->restrictions.bpf_filters->filters);
+		break;
+	case IORING_REGISTER_IO_SLOT:
+		ret = -EINVAL;
+		if (!arg || nr_args != 1)
+			break;
+		ret = io_register_io_slot(ctx, arg);
+		break;
+	case IORING_UNREGISTER_IO_SLOT:
+		ret = -EINVAL;
+		if (!arg || nr_args != 1)
+			break;
+		ret = io_unregister_io_slot(ctx, arg);
 		break;
 	default:
 		ret = -EINVAL;

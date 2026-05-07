@@ -1382,7 +1382,9 @@ int io_do_iopoll(struct io_ring_ctx *ctx, bool force_nonspin)
 		wq_list_add_tail(&req->comp_list, &ctx->submit_state.compl_reqs);
 		nr_events++;
 		req->cqe.flags = io_put_kbuf(req, max(req->cqe.res, 0), NULL);
-		if (!io_is_uring_cmd(req) && !io_is_slot_op(req))
+		if (io_is_slot_op(req))
+			io_slot_iopoll_done(req);
+		else if (!io_is_uring_cmd(req))
 			io_req_rw_cleanup(req, 0);
 	}
 	if (nr_events)
