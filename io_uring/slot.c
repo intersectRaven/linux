@@ -122,7 +122,7 @@ static void io_slot_table_remove(struct io_ring_ctx *ctx, unsigned int id)
 	t->slots[id] = NULL;
 }
 
-static void io_slot_dma_unmap(struct io_slot *slot);
+static void io_buf_put_dma(struct io_mapped_ubuf *imu, struct io_slot_dma *dma);
 
 static void io_slot_dma_sync(struct io_slot *slot, struct bio *bio,
 			     bool for_device)
@@ -233,7 +233,7 @@ static void io_free_io_slot(struct io_ring_ctx *ctx, struct io_slot *slot)
 {
 	WARN_ON_ONCE(io_slot_busy(slot));
 
-	io_slot_dma_unmap(slot);
+	io_buf_put_dma(slot->buf_node->buf, slot->dma);
 	bio_uninit(&slot->bio);
 	io_put_rsrc_node(ctx, slot->buf_node);
 	io_put_rsrc_node(ctx, slot->file_node);
@@ -273,20 +273,29 @@ static struct block_device *io_slot_validate_file(struct file *file)
 }
 
 /*
+ * Refcounted (imu, dma_dev) DMA mapping. Slots referencing the same
+ * registered buffer + device share a single mapping; the first slot to
+ * register builds it, subsequent ones bump refs, and the last one to
+ * unregister tears it down. Chained on imu->dma_mappings.
+ */
+struct io_buf_dma {
+	struct io_slot_dma	dma;		/* embedded; slot->dma points here */
+	struct device		*dma_dev;	/* key */
+	refcount_t		refs;
+	struct list_head	list;
+};
+
+/*
  * Build a persistent DMA mapping for the slot's registered buffer.
  */
-static int io_slot_dma_map(struct io_slot *slot, struct device *dma_dev)
+static int io_imu_dma_map(struct io_mapped_ubuf *imu, struct io_slot_dma *dma,
+			  struct device *dma_dev)
 {
-	struct io_mapped_ubuf *imu = slot->buf_node->buf;
 	const enum dma_data_direction dir = DMA_BIDIRECTIONAL;
-	struct io_slot_dma *dma;
 	size_t mapped = 0;
 	unsigned int i;
 	int ret;
 
-	dma = kzalloc(sizeof(*dma), GFP_KERNEL_ACCOUNT);
-	if (!dma)
-		return -ENOMEM;
 	dma->dma_dev = dma_dev;
 	dma->dir = dir;
 	dma->nr_segs = imu->nr_bvecs;
@@ -312,7 +321,6 @@ static int io_slot_dma_map(struct io_slot *slot, struct device *dma_dev)
 			ret = -EIO;
 			goto unlink;
 		}
-		slot->dma = dma;
 		return 0;
 
 unlink:
@@ -322,17 +330,14 @@ unlink:
 					imu->bvec[i].bv_len, dir, 0);
 		}
 		dma_iova_free(dma_dev, &dma->state);
-		kfree(dma);
 		return ret;
 	}
 
 	/* Direct path: per-bvec dma_map_page. */
 	dma->seg_addrs = kvmalloc_array(imu->nr_bvecs, sizeof(dma_addr_t),
 					GFP_KERNEL_ACCOUNT);
-	if (!dma->seg_addrs) {
-		kfree(dma);
+	if (!dma->seg_addrs)
 		return -ENOMEM;
-	}
 	for (i = 0; i < imu->nr_bvecs; i++) {
 		struct bio_vec *bv = &imu->bvec[i];
 		dma_addr_t addr;
@@ -344,23 +349,16 @@ unlink:
 				dma_unmap_page(dma_dev, dma->seg_addrs[i],
 					imu->bvec[i].bv_len, dir);
 			kvfree(dma->seg_addrs);
-			kfree(dma);
 			return -ENOMEM;
 		}
 		dma->seg_addrs[i] = addr;
 	}
-	slot->dma = dma;
 	return 0;
 }
 
-static void io_slot_dma_unmap(struct io_slot *slot)
+static void io_imu_dma_unmap(struct io_mapped_ubuf *imu, struct io_slot_dma *dma)
 {
-	struct io_mapped_ubuf *imu = slot->buf_node->buf;
-	struct io_slot_dma *dma = slot->dma;
 	unsigned int i;
-
-	if (!dma)
-		return;
 
 	if (dma_use_iova(&dma->state)) {
 		dma_iova_destroy(dma->dma_dev, &dma->state, imu->len,
@@ -371,8 +369,51 @@ static void io_slot_dma_unmap(struct io_slot *slot)
 				       imu->bvec[i].bv_len, dma->dir);
 		kvfree(dma->seg_addrs);
 	}
-	kfree(dma);
-	slot->dma = NULL;
+}
+
+/*
+ * Look up an existing (imu, dma_dev) mapping or build a fresh one.
+ * Caller holds ctx->uring_lock so list mutation is serialised.
+ */
+static struct io_slot_dma *io_buf_get_dma(struct io_mapped_ubuf *imu,
+					  struct device *dma_dev)
+{
+	struct io_buf_dma *bd;
+	int ret;
+
+	list_for_each_entry(bd, &imu->dma_mappings, list) {
+		if (bd->dma_dev == dma_dev) {
+			refcount_inc(&bd->refs);
+			return &bd->dma;
+		}
+	}
+
+	bd = kzalloc(sizeof(*bd), GFP_KERNEL_ACCOUNT);
+	if (!bd)
+		return ERR_PTR(-ENOMEM);
+	ret = io_imu_dma_map(imu, &bd->dma, dma_dev);
+	if (ret < 0) {
+		kfree(bd);
+		return ERR_PTR(ret);
+	}
+	bd->dma_dev = dma_dev;
+	refcount_set(&bd->refs, 1);
+	list_add(&bd->list, &imu->dma_mappings);
+	return &bd->dma;
+}
+
+static void io_buf_put_dma(struct io_mapped_ubuf *imu, struct io_slot_dma *dma)
+{
+	struct io_buf_dma *bd;
+
+	if (!dma)
+		return;
+	bd = container_of(dma, struct io_buf_dma, dma);
+	if (!refcount_dec_and_test(&bd->refs))
+		return;
+	list_del(&bd->list);
+	io_imu_dma_unmap(imu, &bd->dma);
+	kfree(bd);
 }
 
 int io_register_io_slot(struct io_ring_ctx *ctx, void __user *arg)
@@ -437,8 +478,10 @@ int io_register_io_slot(struct io_ring_ctx *ctx, void __user *arg)
 	bio_set_flag(&slot->bio, BIO_REGISTERED);
 
 	if (bdev_get_queue(bdev)->dma_dev) {
-		ret = io_slot_dma_map(slot, bdev_get_queue(bdev)->dma_dev);
-		if (ret < 0) {
+		slot->dma = io_buf_get_dma(imu, bdev_get_queue(bdev)->dma_dev);
+		if (IS_ERR(slot->dma)) {
+			ret = PTR_ERR(slot->dma);
+			slot->dma = NULL;
 			io_put_rsrc_node(ctx, file_node);
 			io_put_rsrc_node(ctx, buf_node);
 			bio_uninit(&slot->bio);
@@ -456,7 +499,7 @@ int io_register_io_slot(struct io_ring_ctx *ctx, void __user *arg)
 		return slot_id;
 	}
 
-	io_slot_dma_unmap(slot);
+	io_buf_put_dma(imu, slot->dma);
 	io_put_rsrc_node(ctx, file_node);
 	io_put_rsrc_node(ctx, buf_node);
 	bio_uninit(&slot->bio);
