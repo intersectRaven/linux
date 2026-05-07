@@ -77,6 +77,7 @@
 #include "fdinfo.h"
 #include "kbuf.h"
 #include "rsrc.h"
+#include "slot.h"
 #include "cancel.h"
 #include "net.h"
 #include "notif.h"
@@ -2178,6 +2179,7 @@ static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
 	io_sq_thread_finish(ctx);
 
 	mutex_lock(&ctx->uring_lock);
+	io_free_io_slots(ctx);
 	io_sqe_buffers_unregister(ctx);
 	io_sqe_files_unregister(ctx);
 	io_unregister_zcrx(ctx);
