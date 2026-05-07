@@ -51,6 +51,8 @@ struct io_slot_rw {
 	u8		op;
 };
 
+#define IO_SLOT_TABLE_MAX	USHRT_MAX
+
 static struct io_slot *io_slot_lookup(struct io_ring_ctx *ctx, unsigned int id)
 {
 	struct io_slot_table *t = &ctx->slot_table;
@@ -60,6 +62,103 @@ static struct io_slot *io_slot_lookup(struct io_ring_ctx *ctx, unsigned int id)
 		return t->slots[id];
 	}
 	return NULL;
+}
+
+/* Caller holds ctx->uring_lock. */
+static int io_slot_table_alloc(struct io_ring_ctx *ctx, struct io_slot *slot,
+			       u32 *id_out)
+{
+	struct io_slot_table *t = &ctx->slot_table;
+	struct io_slot **new_slots;
+	unsigned int i, new_nr;
+
+	for (i = 0; i < t->nr_slots; i++)
+		if (!t->slots[i])
+			goto found;
+
+	if (t->nr_slots >= IO_SLOT_TABLE_MAX)
+		return -ENFILE;
+
+	new_nr = t->nr_slots ? t->nr_slots * 2 : 8;
+	if (new_nr >= IO_SLOT_TABLE_MAX)
+		new_nr = IO_SLOT_TABLE_MAX;
+
+	new_slots = kvmalloc_array(new_nr, sizeof(*new_slots),
+				   GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+	if (!new_slots)
+		return -ENOMEM;
+	if (t->slots) {
+		memcpy(new_slots, t->slots, t->nr_slots * sizeof(*new_slots));
+		kvfree(t->slots);
+	}
+	t->slots = new_slots;
+	t->nr_slots = new_nr;
+	/* i still points at the first newly-grown entry */
+found:
+	t->slots[i] = slot;
+	*id_out = i;
+	return 0;
+}
+
+static void io_slot_table_remove(struct io_ring_ctx *ctx, unsigned int id)
+{
+	struct io_slot_table *t = &ctx->slot_table;
+
+	if (WARN_ON_ONCE(id >= t->nr_slots))
+		return;
+	t->slots[id] = NULL;
+}
+
+static void io_slot_done_inline(struct io_kiocb *req)
+{
+	struct io_slot_rw *rw = io_kiocb_to_cmd(req, struct io_slot_rw);
+	struct io_slot *slot = rw->slot;
+
+	if (rw->bio == &slot->bio)
+		WRITE_ONCE(slot->req, NULL);
+}
+
+void io_slot_iopoll_done(struct io_kiocb *req)
+{
+	io_slot_done_inline(req);
+}
+
+static void io_slot_task_complete(struct io_tw_req tw_req, io_tw_token_t tw)
+{
+	io_slot_done_inline(tw_req.req);
+	io_req_complete_defer(tw_req.req);
+}
+
+static void io_slot_complete(struct io_kiocb *req, int res)
+{
+	if (req->flags & REQ_F_IOPOLL) {
+		req->cqe.res = res;
+		smp_store_release(&req->iopoll_completed, 1);
+		return;
+	}
+
+	io_req_set_res(req, res, 0);
+	req->io_task_work.func = io_slot_task_complete;
+	io_req_task_work_add(req);
+}
+
+static void io_slot_bio_end_io(struct bio *bio)
+{
+	struct io_slot *slot = container_of(bio, struct io_slot, bio);
+	struct io_kiocb *req = READ_ONCE(slot->req);
+	struct io_slot_rw *rw = io_kiocb_to_cmd(req, struct io_slot_rw);
+	int res = (int) rw->nbytes;
+
+	if (bio->bi_status)
+		res = blk_status_to_errno(bio->bi_status);
+
+	/* reset the per-IO mutable bits */
+	bio->bi_next = NULL;
+	bio->bi_iter.bi_sector = 0;
+	bio->bi_iter.bi_size = 0;
+	bio->bi_status = 0;
+
+	io_slot_complete(req, res);
 }
 
 static bool io_slot_busy(struct io_slot *slot)
@@ -75,6 +174,126 @@ static void io_free_io_slot(struct io_ring_ctx *ctx, struct io_slot *slot)
 	io_put_rsrc_node(ctx, slot->buf_node);
 	io_put_rsrc_node(ctx, slot->file_node);
 	kfree(slot);
+}
+
+static struct block_device *io_slot_validate_file(struct file *file)
+{
+	struct block_device *bdev;
+
+	if (!S_ISBLK(file_inode(file)->i_mode))
+		return ERR_PTR(-EINVAL);
+
+	bdev = file_bdev(file);
+	if (!bdev)
+		return ERR_PTR(-EINVAL);
+
+	/*
+	 * Partitions would need bd_start_sect folded into bi_sector at
+	 * submit time (or a remap step), and we explicitly skip
+	 * blk_partition_remap() in submit_bio_noacct_fast(). Reject for
+	 * now.
+	 */
+	if (bdev_is_partition(bdev))
+		return ERR_PTR(-EOPNOTSUPP);
+
+	if (bdev_test_flag(bdev, BD_HAS_SUBMIT_BIO))
+		return ERR_PTR(-EOPNOTSUPP);
+
+	return bdev;
+}
+
+int io_register_io_slot(struct io_ring_ctx *ctx, void __user *arg)
+{
+	struct io_uring_slot_reg reg;
+	struct io_rsrc_node *buf_node, *file_node;
+	struct io_mapped_ubuf *imu;
+	struct block_device *bdev;
+	struct io_slot *slot;
+	struct file *file;
+	u32 slot_id;
+	int ret;
+
+	lockdep_assert_held(&ctx->uring_lock);
+
+	if (copy_from_user(&reg, arg, sizeof(reg)))
+		return -EFAULT;
+	if (reg.resv)
+		return -EINVAL;
+
+	buf_node = io_rsrc_node_lookup(&ctx->buf_table, reg.buf_index);
+	if (!buf_node)
+		return -EINVAL;
+	file_node = io_rsrc_node_lookup(&ctx->file_table.data, reg.file_index);
+	if (!file_node)
+		return -EINVAL;
+
+	file = io_slot_file(file_node);
+	bdev = io_slot_validate_file(file);
+	if (IS_ERR(bdev))
+		return PTR_ERR(bdev);
+
+	if ((ctx->flags & IORING_SETUP_IOPOLL) &&
+	    !(bdev_get_queue(bdev)->limits.features & BLK_FEAT_POLL))
+		return -EOPNOTSUPP;
+
+	imu = buf_node->buf;
+	if (!imu)
+		return -EINVAL;
+
+	if (imu->flags & IO_REGBUF_F_KBUF)
+		return -EINVAL;
+
+	slot = kzalloc(sizeof(*slot), GFP_KERNEL_ACCOUNT);
+	if (!slot)
+		return -ENOMEM;
+
+	/* Pin buf and file for the lifetime of the slot. */
+	buf_node->refs++;
+	file_node->refs++;
+
+	slot->buf_node = buf_node;
+	slot->file_node = file_node;
+	slot->bdev = bdev;
+
+	/* Upfront init of the bio */
+	bio_init(&slot->bio, bdev, imu->bvec, imu->nr_bvecs, REQ_OP_READ);
+	slot->bio.bi_end_io = io_slot_bio_end_io;
+	bio_set_flag(&slot->bio, BIO_REGISTERED);
+
+	ret = io_slot_table_alloc(ctx, slot, &slot_id);
+	if (!ret) {
+		slot->id = slot_id;
+		return slot_id;
+	}
+
+	io_put_rsrc_node(ctx, file_node);
+	io_put_rsrc_node(ctx, buf_node);
+	bio_uninit(&slot->bio);
+	kfree(slot);
+	return ret;
+}
+
+int io_unregister_io_slot(struct io_ring_ctx *ctx, void __user *arg)
+{
+	struct io_slot *slot;
+	u32 slot_id;
+
+	lockdep_assert_held(&ctx->uring_lock);
+
+	if (copy_from_user(&slot_id, arg, sizeof(slot_id)))
+		return -EFAULT;
+
+	slot = io_slot_lookup(ctx, slot_id);
+	if (!slot)
+		return -ENOENT;
+
+	/* slot busy */
+	if (io_slot_busy(slot))
+		return -EBUSY;
+
+	io_slot_table_remove(ctx, slot_id);
+	io_free_io_slot(ctx, slot);
+	return 0;
 }
 
 void io_free_io_slots(struct io_ring_ctx *ctx)
