@@ -16,6 +16,7 @@ obj-$(CONFIG_IO_URING)		+= io_uring.o opdef.o kbuf.o rsrc.o notif.o \
 					truncate.o memmap.o alloc_cache.o \
 					query.o loop.o
 
+obj-$(CONFIG_IO_URING_SLOT_RW)	+= slot.o
 obj-$(CONFIG_IO_URING_ZCRX)	+= zcrx.o
 obj-$(CONFIG_IO_WQ)		+= io-wq.o
 obj-$(CONFIG_FUTEX)		+= futex.o

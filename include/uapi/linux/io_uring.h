@@ -318,6 +318,7 @@ enum io_uring_op {
 	IORING_OP_PIPE,
 	IORING_OP_NOP128,
 	IORING_OP_URING_CMD128,
+	IORING_OP_SLOT_RW,
 
 	/* this goes last, obviously */
 	IORING_OP_LAST,
@@ -493,6 +494,13 @@ enum io_uring_msg_ring_flags {
 #define IORING_NOP_FIXED_BUFFER		(1U << 3)
 #define IORING_NOP_TW			(1U << 4)
 #define IORING_NOP_CQE32		(1U << 5)
+
+/*
+ * IORING_OP_SLOT_RW flags (sqe->rw_flags)
+ *
+ * IORING_SLOT_RW_WRITE		Direction is write. Default (not set) is read.
+ */
+#define IORING_SLOT_RW_WRITE		(1U << 0)
 
 /*
  * IO completion data structure (Completion Queue Entry)
