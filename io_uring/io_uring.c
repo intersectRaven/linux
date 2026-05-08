@@ -1810,6 +1810,14 @@ static int io_init_req(struct io_ring_ctx *ctx, struct io_kiocb *req,
 		return io_init_fail_req(req, -EINVAL);
 	if (!def->iopoll && (ctx->flags & IORING_SETUP_IOPOLL))
 		return io_init_fail_req(req, -EINVAL);
+	if (def->iopoll && (ctx->flags & IORING_SETUP_IOPOLL)) {
+		/*
+		 * Set REQ_F_IOPOLL and clear iopoll_completed once at SQE
+		 * init so each opcode's issue path doesn't have to do it.
+		 */
+		req->flags |= REQ_F_IOPOLL;
+		req->iopoll_completed = 0;
+	}
 
 	if (def->needs_file) {
 		struct io_submit_state *state = &ctx->submit_state;
