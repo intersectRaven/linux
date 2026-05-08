@@ -2689,6 +2689,8 @@ static void blk_mq_bio_to_request(struct request *rq, struct bio *bio,
 
 	if (bio->bi_opf & REQ_RAHEAD)
 		rq->cmd_flags |= REQ_FAILFAST_MASK;
+	if (bio_flagged(bio, BIO_REGISTERED))
+		rq->rq_flags |= RQF_REGISTERED;
 
 	rq->bio = rq->biotail = bio;
 	rq->__sector = bio->bi_iter.bi_sector;
