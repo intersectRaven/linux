@@ -532,6 +532,12 @@ struct request_queue {
 
 	struct queue_limits	limits;
 
+	/*
+	 * Device used for persistent DMA mappings. Drivers supporting
+	 * BIO_REGISTERED must set this.
+	 */
+	struct device		*dma_dev;
+
 #ifdef CONFIG_PM
 	struct device		*dev;
 	enum rpm_status		rpm_status;

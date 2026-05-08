@@ -6,6 +6,7 @@
 #include <linux/task_work.h>
 #include <linux/bitmap.h>
 #include <linux/llist.h>
+#include <linux/dma-mapping.h>
 #include <uapi/linux/io_uring.h>
 
 struct iou_loop_params;
@@ -88,6 +89,31 @@ struct io_mapped_region {
 	unsigned		nr_pages;
 	unsigned		flags;
 };
+
+struct io_slot_dma {
+	struct dma_iova_state	state;
+	dma_addr_t		*seg_addrs;	/* nr_segs entries when !iova */
+	unsigned int		nr_segs;
+	unsigned int		folio_shift;	/* uniform-bvec shift; copied from imu */
+	struct device		*dma_dev;
+	enum dma_data_direction	dir;
+};
+
+/*
+ * For a BIO_REGISTERED bio, return the byte offset into the registered
+ * buffer that bio->bi_iter currently points at.
+ */
+static inline size_t io_slot_buf_offset(const struct io_slot_dma *dma,
+					const struct bio *bio)
+{
+	unsigned int idx = bio->bi_iter.bi_idx;
+	size_t off = bio->bi_iter.bi_bvec_done;
+
+	if (!idx)
+		return off;
+	return bio->bi_io_vec[0].bv_len +
+	       ((size_t)(idx - 1) << dma->folio_shift) + off;
+}
 
 /*
  * Return value from io_buffer_list selection, to avoid stashing it in
