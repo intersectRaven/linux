@@ -39,6 +39,7 @@ struct io_slot {
 
 	/* Set to a valid request when the slot is currently undergoing IO */
 	struct io_kiocb		*req;
+	atomic_t		in_flight;	/* overflow bios only */
 	u32			id;
 
 	struct bio		bio;
@@ -53,6 +54,12 @@ struct io_slot_rw {
 	struct io_slot	*slot;
 	struct bio	*bio;
 	u8		op;
+};
+
+struct io_slot_overflow {
+	struct io_slot		*slot;
+	struct io_kiocb		*req;
+	struct bio		bio;
 };
 
 #define IO_SLOT_TABLE_MAX	USHRT_MAX
@@ -167,7 +174,7 @@ static void io_slot_bio_end_io(struct bio *bio)
 
 static bool io_slot_busy(struct io_slot *slot)
 {
-	return READ_ONCE(slot->req);
+	return READ_ONCE(slot->req) || atomic_read(&slot->in_flight);
 }
 
 static void io_free_io_slot(struct io_ring_ctx *ctx, struct io_slot *slot)
@@ -178,6 +185,20 @@ static void io_free_io_slot(struct io_ring_ctx *ctx, struct io_slot *slot)
 	io_put_rsrc_node(ctx, slot->buf_node);
 	io_put_rsrc_node(ctx, slot->file_node);
 	kfree(slot);
+}
+
+static void io_slot_overflow_bio_end_io(struct bio *bio)
+{
+	struct io_slot_overflow *o = container_of(bio, struct io_slot_overflow, bio);
+	struct io_slot *slot = o->slot;
+	struct io_kiocb *req = o->req;
+	int res = blk_status_to_errno(bio->bi_status);
+
+	io_slot_complete(req, res);
+
+	bio_uninit(bio);
+	kfree(o);
+	atomic_dec(&slot->in_flight);
 }
 
 static struct block_device *io_slot_validate_file(struct file *file)
@@ -350,16 +371,31 @@ static int io_slot_submit(struct io_ring_ctx *ctx, struct io_kiocb *req,
 	walk = rw->buf_off;
 	bvec = io_imu_offset_to_bvec(imu, &walk);
 
-	if (smp_load_acquire(&slot->req)) {
+	if (!smp_load_acquire(&slot->req)) {
+		/* Fast path, slot not in use */
+		smp_store_release(&slot->req, req);
 		io_ring_submit_unlock(ctx, issue_flags);
-		req_set_fail(req);
-		return -EBUSY;
+		bio = &slot->bio;
+	} else {
+		struct io_slot_overflow *o;
+
+		/* Inline slot used, alloc bio */
+		atomic_inc(&slot->in_flight);
+		io_ring_submit_unlock(ctx, issue_flags);
+
+		o = kmalloc(sizeof(*o), GFP_KERNEL);
+		if (!o) {
+			atomic_dec(&slot->in_flight);
+			req_set_fail(req);
+			return -ENOMEM;
+		}
+		o->slot = slot;
+		o->req = req;
+		bio = &o->bio;
+		bio_init(bio, slot->bdev, imu->bvec, imu->nr_bvecs, REQ_OP_READ);
+		bio_set_flag(bio, BIO_REGISTERED);
+		bio->bi_end_io = io_slot_overflow_bio_end_io;
 	}
-
-	smp_store_release(&slot->req, req);
-	io_ring_submit_unlock(ctx, issue_flags);
-
-	bio = &slot->bio;
 
 	opf = (__force blk_opf_t) rw->op;
 	if (req->flags & REQ_F_IOPOLL)
