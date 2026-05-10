@@ -23,6 +23,7 @@
 #include "rsrc.h"
 #include "poll.h"
 #include "rw.h"
+#include "slot.h"
 
 static void io_complete_rw(struct kiocb *kiocb, long res);
 static void io_complete_rw_iopoll(struct kiocb *kiocb, long res);
@@ -504,7 +505,7 @@ static bool io_rw_should_reissue(struct io_kiocb *req)
 	if (!S_ISBLK(mode) && !S_ISREG(mode))
 		return false;
 	if ((req->flags & REQ_F_NOWAIT) || (io_wq_current_is_worker() &&
-	    !(ctx->flags & IORING_SETUP_IOPOLL)))
+	    !(req->flags & REQ_F_IOPOLL)))
 		return false;
 	/*
 	 * If ref is dying, we might be running poll reap from the exit work.
@@ -640,7 +641,7 @@ static inline void io_rw_done(struct io_kiocb *req, ssize_t ret)
 		}
 	}
 
-	if (req->ctx->flags & IORING_SETUP_IOPOLL)
+	if (req->flags & REQ_F_IOPOLL)
 		io_complete_rw_iopoll(&rw->kiocb, ret);
 	else
 		io_complete_rw(&rw->kiocb, ret);
@@ -654,7 +655,7 @@ static int kiocb_done(struct io_kiocb *req, ssize_t ret,
 
 	if (ret >= 0 && req->flags & REQ_F_CUR_POS)
 		req->file->f_pos = rw->kiocb.ki_pos;
-	if (ret >= 0 && !(req->ctx->flags & IORING_SETUP_IOPOLL)) {
+	if (ret >= 0 && !(req->flags & REQ_F_IOPOLL)) {
 		u32 cflags = 0;
 
 		__io_complete_rw_common(req, ret);
@@ -878,7 +879,6 @@ static int io_rw_init_file(struct io_kiocb *req, fmode_t mode, int rw_type)
 			return -EOPNOTSUPP;
 		kiocb->private = NULL;
 		kiocb->ki_flags |= IOCB_HIPRI;
-		req->iopoll_completed = 0;
 		if (ctx->flags & IORING_SETUP_HYBRID_IOPOLL) {
 			/* make sure every req only blocks once*/
 			req->flags &= ~REQ_F_IOPOLL_STATE;
@@ -963,7 +963,7 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 		if (io_file_can_poll(req))
 			return -EAGAIN;
 		/* IOPOLL retry should happen for io-wq threads */
-		if (!force_nonblock && !(req->ctx->flags & IORING_SETUP_IOPOLL))
+		if (!force_nonblock && !(req->flags & REQ_F_IOPOLL))
 			goto done;
 		/* no retry on NONBLOCK nor RWF_NOWAIT */
 		if (req->flags & REQ_F_NOWAIT)
@@ -1188,7 +1188,7 @@ int io_write(struct io_kiocb *req, unsigned int issue_flags)
 		goto done;
 	if (!force_nonblock || ret2 != -EAGAIN) {
 		/* IOPOLL retry should happen for io-wq threads */
-		if (ret2 == -EAGAIN && (req->ctx->flags & IORING_SETUP_IOPOLL))
+		if (ret2 == -EAGAIN && (req->flags & REQ_F_IOPOLL))
 			goto ret_eagain;
 
 		if (ret2 != req->cqe.res && ret2 >= 0 && need_complete_io(req)) {
@@ -1259,6 +1259,9 @@ static int io_uring_classic_poll(struct io_kiocb *req, struct io_comp_batch *iob
 
 		ioucmd = io_kiocb_to_cmd(req, struct io_uring_cmd);
 		return file->f_op->uring_cmd_iopoll(ioucmd, iob, poll_flags);
+	} else if (io_is_slot_op(req)) {
+		/* slot ops have no file assigned, use private poll handler */
+		return io_slot_iopoll(req, iob, poll_flags);
 	} else {
 		struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
 
@@ -1380,7 +1383,9 @@ int io_do_iopoll(struct io_ring_ctx *ctx, bool force_nonspin)
 		wq_list_add_tail(&req->comp_list, &ctx->submit_state.compl_reqs);
 		nr_events++;
 		req->cqe.flags = io_put_kbuf(req, req->cqe.res, NULL);
-		if (!io_is_uring_cmd(req))
+		if (io_is_slot_op(req))
+			io_slot_iopoll_done(req);
+		else if (!io_is_uring_cmd(req))
 			io_req_rw_cleanup(req, 0);
 	}
 	if (nr_events)

@@ -6,6 +6,7 @@
 #include <linux/task_work.h>
 #include <linux/bitmap.h>
 #include <linux/llist.h>
+#include <linux/dma-mapping.h>
 #include <uapi/linux/io_uring.h>
 
 enum {
@@ -83,6 +84,31 @@ struct io_mapped_region {
 	unsigned		nr_pages;
 	unsigned		flags;
 };
+
+struct io_slot_dma {
+	struct dma_iova_state	state;
+	dma_addr_t		*seg_addrs;	/* nr_segs entries when !iova */
+	unsigned int		nr_segs;
+	unsigned int		folio_shift;	/* uniform-bvec shift; copied from imu */
+	struct device		*dma_dev;
+	enum dma_data_direction	dir;
+};
+
+/*
+ * For a BIO_REGISTERED bio, return the byte offset into the registered
+ * buffer that bio->bi_iter currently points at.
+ */
+static inline size_t io_slot_buf_offset(const struct io_slot_dma *dma,
+					const struct bio *bio)
+{
+	unsigned int idx = bio->bi_iter.bi_idx;
+	size_t off = bio->bi_iter.bi_bvec_done;
+
+	if (!idx)
+		return off;
+	return bio->bi_io_vec[0].bv_len +
+	       ((size_t)(idx - 1) << dma->folio_shift) + off;
+}
 
 /*
  * Return value from io_buffer_list selection, to avoid stashing it in
@@ -268,6 +294,11 @@ struct io_alloc_cache {
 	unsigned int		init_clear;
 };
 
+struct io_slot_table {
+	struct io_slot		**slots;
+	unsigned int		nr_slots;
+};
+
 struct io_ring_ctx {
 	/* const or read-mostly hot data */
 	struct {
@@ -337,6 +368,7 @@ struct io_ring_ctx {
 
 		struct io_file_table	file_table;
 		struct io_rsrc_data	buf_table;
+		struct io_slot_table	slot_table;
 		struct io_alloc_cache	node_cache;
 		struct io_alloc_cache	imu_cache;
 
@@ -431,6 +463,9 @@ struct io_ring_ctx {
 
 	/* Stores zcrx object pointers of type struct io_zcrx_ifq */
 	struct xarray			zcrx_ctxs;
+
+	/* Used for accounting references on pages in registered buffers */
+	struct xarray		hpage_acct;
 
 	u32			pers_next;
 	struct xarray		personalities;
@@ -545,6 +580,7 @@ enum {
 	REQ_F_HAS_METADATA_BIT,
 	REQ_F_IMPORT_BUFFER_BIT,
 	REQ_F_SQE_COPIED_BIT,
+	REQ_F_IOPOLL_BIT,
 
 	/* not a real bit, just to check we're not overflowing the space */
 	__REQ_F_LAST_BIT,
@@ -638,6 +674,8 @@ enum {
 	REQ_F_IMPORT_BUFFER	= IO_REQ_FLAG(REQ_F_IMPORT_BUFFER_BIT),
 	/* ->sqe_copy() has been called, if necessary */
 	REQ_F_SQE_COPIED	= IO_REQ_FLAG(REQ_F_SQE_COPIED_BIT),
+	/* request must be iopolled to completion (set in ->issue()) */
+	REQ_F_IOPOLL		= IO_REQ_FLAG(REQ_F_IOPOLL_BIT),
 };
 
 struct io_tw_req {

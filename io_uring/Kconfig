@@ -14,3 +14,8 @@ config IO_URING_BPF
 	def_bool y
 	depends on BPF
 	depends on NET
+
+config IO_URING_SLOT_RW
+	def_bool y
+	depends on IO_URING
+	depends on BLOCK
