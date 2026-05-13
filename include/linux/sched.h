@@ -2429,6 +2429,7 @@ struct sched_cache_stat {
 	unsigned long epoch;
 	u64 nr_running_avg;
 	unsigned long next_scan;
+	unsigned long footprint;
 	int cpu;
 } ____cacheline_aligned_in_smp;
 
