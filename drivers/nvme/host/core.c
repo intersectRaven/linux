@@ -4169,6 +4169,7 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, struct nvme_ns_info *info)
 	/* Set DMA device for io_uring registered slots */
 	if (ctrl->ops->dma_dev)
 		disk->queue->dma_dev = ctrl->ops->dma_dev(ctrl);
+	disk->queue->persistent_dma_setup = ctrl->ops->persistent_dma_setup;
 
 	ns->disk = disk;
 	ns->queue = disk->queue;

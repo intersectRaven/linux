@@ -643,6 +643,9 @@ struct nvme_ctrl_ops {
 
 	/* return device for DMA mappings */
 	struct device *(*dma_dev)(struct nvme_ctrl *ctrl);
+	/* build persistent driver descriptor for io_slot_dma entry */
+	int (*persistent_dma_setup)(struct request_queue *q,
+				    struct io_slot_dma *dma);
 };
 
 /*
