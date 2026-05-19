@@ -538,6 +538,13 @@ struct request_queue {
 	 */
 	struct device		*dma_dev;
 
+	/*
+	 * build a driver-owned persistent DMA descriptor list on for a
+	 * struct io_slot_dma entry.
+	 */
+	int (*persistent_dma_setup)(struct request_queue *q,
+				    struct io_slot_dma *dma);
+
 #ifdef CONFIG_PM
 	struct device		*dev;
 	enum rpm_status		rpm_status;
