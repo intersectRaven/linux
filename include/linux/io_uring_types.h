@@ -95,8 +95,16 @@ struct io_slot_dma {
 	dma_addr_t		*seg_addrs;	/* nr_segs entries when !iova */
 	unsigned int		nr_segs;
 	unsigned int		folio_shift;	/* uniform-bvec shift; copied from imu */
+	size_t			len;		/* total mapped length, == imu->len */
 	struct device		*dma_dev;
 	enum dma_data_direction	dir;
+
+	/*
+	 * for devices needing persistent state for (generally) bigger buffer
+	 * vectors, like a scatterlist.
+	 */
+	void			*driver_priv;
+	void			(*driver_priv_destroy)(struct io_slot_dma *dma);
 };
 
 /*

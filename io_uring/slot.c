@@ -299,6 +299,7 @@ static int io_imu_dma_map(struct io_mapped_ubuf *imu, struct io_slot_dma *dma,
 	dma->dma_dev = dma_dev;
 	dma->dir = dir;
 	dma->nr_segs = imu->nr_bvecs;
+	dma->len = imu->len;
 	dma->folio_shift = imu->folio_shift;
 
 	/* IOVA path: coalesce the whole buffer into a single IOVA range. */
@@ -376,8 +377,9 @@ static void io_imu_dma_unmap(struct io_mapped_ubuf *imu, struct io_slot_dma *dma
  * Caller holds ctx->uring_lock so list mutation is serialised.
  */
 static struct io_slot_dma *io_buf_get_dma(struct io_mapped_ubuf *imu,
-					  struct device *dma_dev)
+					  struct request_queue *q)
 {
+	struct device *dma_dev = q->dma_dev;
 	struct io_buf_dma *bd;
 	int ret;
 
@@ -398,6 +400,8 @@ static struct io_slot_dma *io_buf_get_dma(struct io_mapped_ubuf *imu,
 	}
 	bd->dma_dev = dma_dev;
 	refcount_set(&bd->refs, 1);
+	if (q->persistent_dma_setup)
+		q->persistent_dma_setup(q, &bd->dma);
 	list_add(&bd->list, &imu->dma_mappings);
 	return &bd->dma;
 }
@@ -412,6 +416,8 @@ static void io_buf_put_dma(struct io_mapped_ubuf *imu, struct io_slot_dma *dma)
 	if (!refcount_dec_and_test(&bd->refs))
 		return;
 	list_del(&bd->list);
+	if (dma->driver_priv_destroy)
+		dma->driver_priv_destroy(dma);
 	io_imu_dma_unmap(imu, &bd->dma);
 	kfree(bd);
 }
@@ -478,7 +484,7 @@ int io_register_io_slot(struct io_ring_ctx *ctx, void __user *arg)
 	bio_set_flag(&slot->bio, BIO_REGISTERED);
 
 	if (bdev_get_queue(bdev)->dma_dev) {
-		slot->dma = io_buf_get_dma(imu, bdev_get_queue(bdev)->dma_dev);
+		slot->dma = io_buf_get_dma(imu, bdev_get_queue(bdev));
 		if (IS_ERR(slot->dma)) {
 			ret = PTR_ERR(slot->dma);
 			slot->dma = NULL;
