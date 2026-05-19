@@ -1206,8 +1206,8 @@ static blk_status_t nvme_pci_setup_data_sgl(struct request *req,
  * BIO_REGISTERED path, just pull dma mappings straight out of it.
  *
  * Returns BLK_STS_OK on success, BLK_STS_AGAIN to fall back to the
- * regular setup path (multi-segment direct-path buffers and IOs that
- * don't fit in two PRPs).
+ * regular setup path (multi-segment direct-path buffers, and IOs
+ * larger than 2 PRPs on PRP-only controllers).
  */
 static blk_status_t nvme_pci_setup_data_registered(struct request *req)
 {
@@ -1236,8 +1236,21 @@ static blk_status_t nvme_pci_setup_data_registered(struct request *req)
 	}
 
 	prp1_offset = dma_addr & (NVME_CTRL_PAGE_SIZE - 1);
-	if (total > NVME_CTRL_PAGE_SIZE * 2 - prp1_offset)
-		return BLK_STS_AGAIN;
+	if (total > NVME_CTRL_PAGE_SIZE * 2 - prp1_offset) {
+		struct nvme_queue *nvmeq = req->mq_hctx->driver_data;
+
+		/* No SGL, transfer too large */
+		if (!nvmeq->qid || !nvme_ctrl_sgl_supported(&nvmeq->dev->ctrl))
+			return BLK_STS_AGAIN;
+
+		iod->total_len = total;
+		iod->flags |= IOD_SINGLE_SEGMENT;
+		iod->cmd.common.flags = NVME_CMD_SGL_METABUF;
+		iod->cmd.common.dptr.sgl.addr = cpu_to_le64(dma_addr);
+		iod->cmd.common.dptr.sgl.length = cpu_to_le32(total);
+		iod->cmd.common.dptr.sgl.type = NVME_SGL_FMT_DATA_DESC << 4;
+		return BLK_STS_OK;
+	}
 
 	iod->total_len = total;
 	iod->flags |= IOD_SINGLE_SEGMENT;
