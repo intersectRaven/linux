@@ -374,7 +374,8 @@ static void imu_v11_0_program_rlc_ram(struct amdgpu_device *adev)
 		imu_v11_0_3_program_rlc_ram(adev);
 		break;
 	default:
-		BUG();
+		WARN(1, "Invalid GFX/IMU IP version 0x%08x\n",
+		     amdgpu_ip_version(adev, GC_HWIP, 0));
 		break;
 	}
 
