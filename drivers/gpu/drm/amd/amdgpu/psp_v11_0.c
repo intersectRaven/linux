@@ -136,7 +136,7 @@ static int psp_v11_0_init_microcode(struct psp_context *psp)
 		err = psp_init_toc_microcode(psp, ucode_prefix);
 		break;
 	default:
-		BUG();
+		return -EINVAL;
 	}
 
 	return err;
