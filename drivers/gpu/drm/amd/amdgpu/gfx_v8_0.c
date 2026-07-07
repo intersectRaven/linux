@@ -977,7 +977,7 @@ static int gfx_v8_0_init_microcode(struct amdgpu_device *adev)
 		chip_name = "vegam";
 		break;
 	default:
-		BUG();
+		return -EINVAL;
 	}
 
 	if (adev->asic_type >= CHIP_POLARIS10 && adev->asic_type <= CHIP_POLARIS12) {
