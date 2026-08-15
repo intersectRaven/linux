@@ -25,14 +25,14 @@
 #include "internals.h"
 
 #if defined(CONFIG_IRQ_FORCED_THREADING) && !defined(CONFIG_PREEMPT_RT)
-DEFINE_STATIC_KEY_FALSE(force_irqthreads_key);
+DEFINE_STATIC_KEY_TRUE(force_irqthreads_key);
 
-static int __init setup_forced_irqthreads(char *arg)
+static int __init setup_noforced_irqthreads(char *arg)
 {
-	static_branch_enable(&force_irqthreads_key);
+	static_branch_disable(&force_irqthreads_key);
 	return 0;
 }
-early_param("threadirqs", setup_forced_irqthreads);
+early_param("nothreadirqs", setup_noforced_irqthreads);
 #endif
 
 #ifdef CONFIG_SMP
