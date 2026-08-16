@@ -43,6 +43,11 @@ struct io_mapped_ubuf {
 	void		*priv;
 	u8		flags;
 	u8		dir;
+	/*
+	 * persistent DMA mappings of this buffer, one for each dma_dev
+	 * mapped, if any. Added on first slot registration of this buffer.
+	 */
+	struct list_head dma_mappings;
 	struct bio_vec	bvec[] __counted_by(nr_bvecs);
 };
 
@@ -92,6 +97,27 @@ int io_validate_user_buf_range(u64 uaddr, u64 ulen);
 
 bool io_check_coalesce_buffer(struct page **page_array, int nr_pages,
 			      struct io_imu_folio_data *data);
+
+/*
+ * Don't use iov_iter_advance() here, as it's really slow for
+ * using the latter parts of a big fixed buffer - it iterates
+ *
+ * 1) it's a BVEC iter, we set it up
+ * 2) all bvecs are the same in size, except potentially the
+ *    first and last bvec
+ */
+static inline const struct bio_vec *
+io_imu_offset_to_bvec(const struct io_mapped_ubuf *imu, size_t *offset)
+{
+	size_t off = *offset;
+
+	if (off < imu->bvec[0].bv_len)
+		return &imu->bvec[0];
+
+	off -= imu->bvec[0].bv_len;
+	*offset = off & ((1UL << imu->folio_shift) - 1);
+	return &imu->bvec[1 + (off >> imu->folio_shift)];
+}
 
 static inline struct io_rsrc_node *io_rsrc_node_lookup(struct io_rsrc_data *data,
 						       unsigned int index)
