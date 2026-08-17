@@ -27,6 +27,7 @@
 #include <linux/io-64-nonatomic-lo-hi.h>
 #include <linux/io-64-nonatomic-hi-lo.h>
 #include <linux/sed-opal.h>
+#include <linux/io_uring_types.h>
 
 #include "trace.h"
 #include "nvme.h"
@@ -937,6 +938,9 @@ static void nvme_unmap_data(struct request *req)
 	struct device *dma_dev = nvmeq->dev->dev;
 	unsigned int attrs = 0;
 
+	if (req->rq_flags & RQF_REGISTERED)
+		return;
+
 	if (iod->flags & IOD_SINGLE_SEGMENT) {
 		static_assert(offsetof(union nvme_data_ptr, prp1) ==
 				offsetof(union nvme_data_ptr, sgl.addr));
@@ -1203,6 +1207,224 @@ static blk_status_t nvme_pci_setup_data_sgl(struct request *req,
 	return iter->status;
 }
 
+/*
+ * Built at slot registration time if the entry requires it. Layout matches
+ * nvme's normal chained PRP list.
+ */
+struct nvme_pci_persistent_prp {
+	struct device		*dev;
+	void			**list_va;
+	dma_addr_t		*list_dma;
+	unsigned int		nr_list_pages;
+};
+
+static void nvme_pci_persistent_prp_free(struct nvme_pci_persistent_prp *ppp)
+{
+	unsigned int i;
+
+	if (!ppp)
+		return;
+	for (i = 0; i < ppp->nr_list_pages; i++)
+		dma_free_coherent(ppp->dev, NVME_CTRL_PAGE_SIZE,
+				  ppp->list_va[i], ppp->list_dma[i]);
+	kvfree(ppp->list_va);
+	kvfree(ppp->list_dma);
+	kfree(ppp);
+}
+
+static void nvme_pci_persistent_dma_destroy(struct io_slot_dma *dma)
+{
+	nvme_pci_persistent_prp_free(dma->driver_priv);
+	dma->driver_priv = NULL;
+}
+
+static int nvme_pci_persistent_dma_setup(struct request_queue *q,
+					 struct io_slot_dma *dma)
+{
+	struct nvme_pci_persistent_prp *ppp;
+	dma_addr_t base, nvme_page_base;
+	unsigned int page_off, total_pages, nr_prps;
+	unsigned int list_idx, entry_idx;
+	unsigned int i;
+
+	if (dma_use_iova(&dma->state))
+		base = dma->state.addr;
+	else if (dma->nr_segs == 1)
+		base = dma->seg_addrs[0];
+	else
+		return 0;
+
+	page_off = base & (NVME_CTRL_PAGE_SIZE - 1);
+	nvme_page_base = base & ~((dma_addr_t)NVME_CTRL_PAGE_SIZE - 1);
+	total_pages = (page_off + dma->len + NVME_CTRL_PAGE_SIZE - 1) >>
+		      NVME_CTRL_PAGE_SHIFT;
+	if (total_pages < 2)
+		return 0;
+	nr_prps = total_pages - 1;	/* PRP1 covers page 0 */
+
+	ppp = kzalloc(sizeof(*ppp), GFP_KERNEL_ACCOUNT);
+	if (!ppp)
+		return -ENOMEM;
+	ppp->dev = dma->dma_dev;
+	ppp->nr_list_pages = DIV_ROUND_UP(nr_prps, PRPS_PER_PAGE);
+
+	ppp->list_va = kvmalloc_array(ppp->nr_list_pages,
+				      sizeof(*ppp->list_va),
+				      GFP_KERNEL_ACCOUNT);
+	ppp->list_dma = kvmalloc_array(ppp->nr_list_pages,
+				       sizeof(*ppp->list_dma),
+				       GFP_KERNEL_ACCOUNT);
+	if (!ppp->list_va || !ppp->list_dma)
+		goto err_free_arrays;
+
+	for (i = 0; i < ppp->nr_list_pages; i++) {
+		ppp->list_va[i] = dma_alloc_coherent(ppp->dev,
+						     NVME_CTRL_PAGE_SIZE,
+						     &ppp->list_dma[i],
+						     GFP_KERNEL_ACCOUNT);
+		if (!ppp->list_va[i]) {
+			ppp->nr_list_pages = i;
+			goto err_free_pages;
+		}
+	}
+
+	/* Fill entries; entries [0..PRPS_PER_PAGE-1] of each page are PRPs. */
+	for (i = 0; i < nr_prps; i++) {
+		__le64 *list;
+
+		list_idx = i / PRPS_PER_PAGE;
+		entry_idx = i % PRPS_PER_PAGE;
+		list = ppp->list_va[list_idx];
+		list[entry_idx] = cpu_to_le64(nvme_page_base +
+				(i + 1) * NVME_CTRL_PAGE_SIZE);
+	}
+
+	/* Chain non-last pages via entry [PRPS_PER_PAGE]. */
+	for (i = 0; i + 1 < ppp->nr_list_pages; i++) {
+		__le64 *list = ppp->list_va[i];
+
+		list[PRPS_PER_PAGE] = cpu_to_le64(ppp->list_dma[i + 1]);
+	}
+
+	dma->driver_priv = ppp;
+	dma->driver_priv_destroy = nvme_pci_persistent_dma_destroy;
+	return 0;
+
+err_free_pages:
+	nvme_pci_persistent_prp_free(ppp);
+	return -ENOMEM;
+err_free_arrays:
+	kvfree(ppp->list_va);
+	kvfree(ppp->list_dma);
+	kfree(ppp);
+	return -ENOMEM;
+}
+
+/*
+ * Return DMA address PRP list entry
+ */
+static dma_addr_t nvme_pci_persistent_prp_ptr(struct io_slot_dma *dma,
+					      dma_addr_t dma_addr,
+					      unsigned int prp1_offset)
+{
+	struct nvme_pci_persistent_prp *ppp = dma->driver_priv;
+	dma_addr_t first_full_page;
+	unsigned int logical_idx;
+	unsigned int list_idx, entry_idx;
+	dma_addr_t base;
+
+	if (!ppp)
+		return 0;
+
+	first_full_page = dma_addr + (NVME_CTRL_PAGE_SIZE - prp1_offset);
+	if (dma_use_iova(&dma->state))
+		base = dma->state.addr;
+	else
+		base = dma->seg_addrs[0];
+	logical_idx = (first_full_page -
+		       (base & ~((dma_addr_t)NVME_CTRL_PAGE_SIZE - 1))) >>
+		      NVME_CTRL_PAGE_SHIFT;
+	/* list[0] = page 1 of buffer, not page 0 */
+	logical_idx--;
+
+	list_idx = logical_idx / PRPS_PER_PAGE;
+	entry_idx = logical_idx % PRPS_PER_PAGE;
+	return ppp->list_dma[list_idx] + entry_idx * sizeof(__le64);
+}
+
+/*
+ * BIO_REGISTERED path, just pull dma mappings straight out of it.
+ *
+ * Returns BLK_STS_OK on success, BLK_STS_AGAIN to fall back to the
+ * regular setup path (multi-segment direct-path buffers, and IOs
+ * larger than 2 PRPs on PRP-only controllers).
+ */
+static blk_status_t nvme_pci_setup_data_registered(struct request *req)
+{
+	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+	struct bio *bio = req->bio;
+	struct io_slot_dma *dma;
+	unsigned int total = blk_rq_payload_bytes(req);
+	unsigned int prp1_offset;
+	dma_addr_t dma_addr;
+
+	if (!bio)
+		return BLK_STS_AGAIN;
+	dma = bio_persistent_dma(bio);
+	if (!dma)
+		return BLK_STS_AGAIN;
+
+	if (dma_use_iova(&dma->state)) {
+		/* IOMMU coalesced the whole buffer into one IOVA range */
+		dma_addr = dma->state.addr + io_slot_buf_offset(dma, bio);
+	} else if (dma->nr_segs == 1) {
+		/* Direct path, no coalescing done */
+		dma_addr = dma->seg_addrs[0] + bio->bi_iter.bi_bvec_done;
+	} else {
+		/* Multi-segment direct path needs walking; fall back. */
+		return BLK_STS_AGAIN;
+	}
+
+	prp1_offset = dma_addr & (NVME_CTRL_PAGE_SIZE - 1);
+	if (total > NVME_CTRL_PAGE_SIZE * 2 - prp1_offset) {
+		struct nvme_queue *nvmeq = req->mq_hctx->driver_data;
+
+		if (nvmeq->qid && nvme_ctrl_sgl_supported(&nvmeq->dev->ctrl)) {
+			iod->total_len = total;
+			iod->flags |= IOD_SINGLE_SEGMENT;
+			iod->cmd.common.flags = NVME_CMD_SGL_METABUF;
+			iod->cmd.common.dptr.sgl.addr = cpu_to_le64(dma_addr);
+			iod->cmd.common.dptr.sgl.length = cpu_to_le32(total);
+			iod->cmd.common.dptr.sgl.type = NVME_SGL_FMT_DATA_DESC << 4;
+			return BLK_STS_OK;
+		}
+
+		/* PRP-only path: use the precomputed list if available. */
+		if (!dma->driver_priv)
+			return BLK_STS_AGAIN;
+
+		iod->total_len = total;
+		iod->flags |= IOD_SINGLE_SEGMENT;
+		iod->cmd.common.dptr.prp1 = cpu_to_le64(dma_addr);
+		iod->cmd.common.dptr.prp2 = cpu_to_le64(
+			nvme_pci_persistent_prp_ptr(dma, dma_addr, prp1_offset));
+		return BLK_STS_OK;
+	}
+
+	iod->total_len = total;
+	iod->flags |= IOD_SINGLE_SEGMENT;
+
+	iod->cmd.common.dptr.prp1 = cpu_to_le64(dma_addr);
+	iod->cmd.common.dptr.prp2 = 0;
+	if (total > NVME_CTRL_PAGE_SIZE - prp1_offset) {
+		unsigned int first_prp_len = NVME_CTRL_PAGE_SIZE - prp1_offset;
+
+		iod->cmd.common.dptr.prp2 =
+			cpu_to_le64(dma_addr + first_prp_len);
+	}
+	return BLK_STS_OK;
+}
+
 static blk_status_t nvme_pci_setup_data_simple(struct request *req,
 		enum nvme_use_sgl use_sgl)
 {
@@ -1250,6 +1472,13 @@ static blk_status_t nvme_map_data(struct request *req)
 	enum nvme_use_sgl use_sgl = nvme_pci_use_sgls(dev, req);
 	struct blk_dma_iter iter;
 	blk_status_t ret;
+
+	ret = nvme_pci_setup_data_registered(req);
+	if (ret != BLK_STS_AGAIN)
+		return ret;
+
+	/* Didn't direct map, clear registered for the completion unmap path */
+	req->rq_flags &= ~RQF_REGISTERED;
 
 	/*
 	 * Try to skip the DMA iterator for single segment requests, as that
@@ -3548,6 +3777,11 @@ static unsigned long nvme_pci_get_virt_boundary(struct nvme_ctrl *ctrl,
 	return 0;
 }
 
+static struct device *nvme_pci_dma_dev(struct nvme_ctrl *ctrl)
+{
+	return to_nvme_dev(ctrl)->dev;
+}
+
 static const struct nvme_ctrl_ops nvme_pci_ctrl_ops = {
 	.name			= "pcie",
 	.module			= THIS_MODULE,
@@ -3563,6 +3797,8 @@ static const struct nvme_ctrl_ops nvme_pci_ctrl_ops = {
 	.print_device_info	= nvme_pci_print_device_info,
 	.supports_pci_p2pdma	= nvme_pci_supports_pci_p2pdma,
 	.get_virt_boundary	= nvme_pci_get_virt_boundary,
+	.dma_dev		= nvme_pci_dma_dev,
+	.persistent_dma_setup	= nvme_pci_persistent_dma_setup,
 };
 
 static int nvme_dev_map(struct nvme_dev *dev)

@@ -6,6 +6,7 @@
 #include <linux/task_work.h>
 #include <linux/bitmap.h>
 #include <linux/llist.h>
+#include <linux/dma-mapping.h>
 #include <uapi/linux/io_uring.h>
 
 struct iou_loop_params;
@@ -100,6 +101,39 @@ struct io_mapped_region {
 	unsigned		nr_pages;
 	unsigned		flags;
 };
+
+struct io_slot_dma {
+	struct dma_iova_state	state;
+	dma_addr_t		*seg_addrs;	/* nr_segs entries when !iova */
+	unsigned int		nr_segs;
+	unsigned int		folio_shift;	/* uniform-bvec shift; copied from imu */
+	size_t			len;		/* total mapped length, == imu->len */
+	struct device		*dma_dev;
+	enum dma_data_direction	dir;
+
+	/*
+	 * for devices needing persistent state for (generally) bigger buffer
+	 * vectors, like a scatterlist.
+	 */
+	void			*driver_priv;
+	void			(*driver_priv_destroy)(struct io_slot_dma *dma);
+};
+
+/*
+ * For a BIO_REGISTERED bio, return the byte offset into the registered
+ * buffer that bio->bi_iter currently points at.
+ */
+static inline size_t io_slot_buf_offset(const struct io_slot_dma *dma,
+					const struct bio *bio)
+{
+	unsigned int idx = bio->bi_iter.bi_idx;
+	size_t off = bio->bi_iter.bi_bvec_done;
+
+	if (!idx)
+		return off;
+	return bio->bi_io_vec[0].bv_len +
+	       ((size_t)(idx - 1) << dma->folio_shift) + off;
+}
 
 /*
  * Return value from io_buffer_list selection, to avoid stashing it in
@@ -293,6 +327,11 @@ struct io_alloc_cache {
 	unsigned int		init_clear;
 };
 
+struct io_slot_table {
+	struct io_slot		**slots;
+	unsigned int		nr_slots;
+};
+
 enum {
 	IO_RING_F_DRAIN_NEXT		= BIT(0),
 	IO_RING_F_OP_RESTRICTED		= BIT(1),
@@ -378,6 +417,7 @@ struct io_ring_ctx {
 
 		struct io_file_table	file_table;
 		struct io_rsrc_data	buf_table;
+		struct io_slot_table	slot_table;
 		struct io_alloc_cache	node_cache;
 		struct io_alloc_cache	imu_cache;
 

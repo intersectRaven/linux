@@ -23,6 +23,7 @@
 #include "rsrc.h"
 #include "poll.h"
 #include "rw.h"
+#include "slot.h"
 
 static void io_complete_rw(struct kiocb *kiocb, long res);
 static void io_complete_rw_iopoll(struct kiocb *kiocb, long res);
@@ -881,10 +882,8 @@ static int io_rw_init_file(struct io_kiocb *req, fmode_t mode, int rw_type)
 	if (ctx->flags & IORING_SETUP_IOPOLL) {
 		if (!(kiocb->ki_flags & IOCB_DIRECT) || !file->f_op->iopoll)
 			return -EOPNOTSUPP;
-		req->flags |= REQ_F_IOPOLL;
 		kiocb->private = NULL;
 		kiocb->ki_flags |= IOCB_HIPRI;
-		req->iopoll_completed = 0;
 		if (ctx->flags & IORING_SETUP_HYBRID_IOPOLL) {
 			/* make sure every req only blocks once*/
 			req->flags &= ~REQ_F_IOPOLL_STATE;
@@ -1267,6 +1266,9 @@ static int io_uring_classic_poll(struct io_kiocb *req, struct io_comp_batch *iob
 
 		ioucmd = io_kiocb_to_cmd(req, struct io_uring_cmd);
 		return file->f_op->uring_cmd_iopoll(ioucmd, iob, poll_flags);
+	} else if (io_is_slot_op(req)) {
+		/* slot ops have no file assigned, use private poll handler */
+		return io_slot_iopoll(req, iob, poll_flags);
 	} else {
 		struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
 
@@ -1388,7 +1390,9 @@ int io_do_iopoll(struct io_ring_ctx *ctx, bool force_nonspin)
 		wq_list_add_tail(&req->comp_list, &ctx->submit_state.compl_reqs);
 		nr_events++;
 		req->cqe.flags = io_put_kbuf(req, max(req->cqe.res, 0), NULL);
-		if (!io_is_uring_cmd(req))
+		if (io_is_slot_op(req))
+			io_slot_iopoll_done(req);
+		else if (!io_is_uring_cmd(req))
 			io_req_rw_cleanup(req, 0);
 	}
 	if (nr_events)
