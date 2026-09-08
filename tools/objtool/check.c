@@ -247,6 +247,9 @@ static bool is_noreturn(struct symbol *func)
 {
 	func = func->alias->pfunc;
 
+	if (func->ignore_noreturn)
+		return false;
+
 	if (is_listed_noreturn(func))
 		return true;
 
@@ -2390,6 +2393,18 @@ static int __annotate_early(struct objtool_file *file, int type, struct instruct
 		insn->noendbr = 1;
 		break;
 
+	/* Must be before detect_noreturns() */
+	case ANNOTYPE_IGNORE_NORETURN: {
+		struct symbol *sym = insn_sym(insn);
+
+		if (!sym) {
+			ERROR_INSN(insn, "dodgy IGNORE_NORETURN annotation");
+			return -1;
+		}
+		sym->ignore_noreturn = 1;
+		break;
+	}
+
 	default:
 		break;
 	}
@@ -2433,6 +2448,10 @@ static int __annotate_late(struct objtool_file *file, int type, struct instructi
 
 	switch (type) {
 	case ANNOTYPE_NOENDBR:
+		/* early */
+		break;
+
+	case ANNOTYPE_IGNORE_NORETURN:
 		/* early */
 		break;
 
