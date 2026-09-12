@@ -1045,6 +1045,17 @@ static inline loff_t folio_pos(const struct folio *folio)
 	return ((loff_t)folio->index) * PAGE_SIZE;
 }
 
+/**
+ * page_pos - The byte position of this page in its file.
+ * @folio: The folio containing @page.
+ * @page: The page.
+ */
+static inline
+loff_t page_pos(const struct folio *folio, const struct page *page)
+{
+	return ((loff_t)page_pgoff(folio, page)) << PAGE_SHIFT;
+}
+
 /*
  * Return byte-offset into filesystem object for page.
  */
@@ -1363,7 +1374,7 @@ struct readahead_control {
 		._index = i,						\
 	}
 
-#define VM_READAHEAD_PAGES	(SZ_128K / PAGE_SIZE)
+#define VM_READAHEAD_PAGES	(SZ_8M / PAGE_SIZE)
 
 void page_cache_ra_unbounded(struct readahead_control *,
 		unsigned long nr_to_read, unsigned long lookahead_count);
@@ -1556,6 +1567,38 @@ static inline ssize_t folio_mkwrite_check_truncate(const struct folio *folio,
 		return folio_size(folio);
 	/* folio is wholly past EOF */
 	if (folio->index > index || !offset)
+		return -EFAULT;
+	/* folio is partially inside EOF */
+	return offset;
+}
+
+/**
+ * page_mkwrite_max_bytes - How many valid bytes are in this page
+ * @inode: The inode containing the folio
+ * @folio: The folio containing the page
+ * @page: The page we are interested in
+ *
+ * Context: The folio should be locked which prevents i_size from changing
+ * in ways which affect this function
+ * Return: the number of valid bytes in this page
+ * or -EFAULT if no bytes are valid.  Cannot return 0.
+ */
+static inline ssize_t page_mkwrite_max_bytes(const struct inode *inode,
+		const struct folio *folio, const struct page *page)
+{
+	loff_t size = i_size_read(inode);
+	pgoff_t index = size >> PAGE_SHIFT;
+	pgoff_t page_index = page_pgoff(folio, page);
+	size_t offset = offset_in_page(size);
+
+	if (!folio->mapping)
+		return -EFAULT;
+
+	/* page is wholly inside EOF */
+	if (page_index < index)
+		return PAGE_SIZE;
+	/* page is wholly past EOF */
+	if (page_index > index || !offset)
 		return -EFAULT;
 	/* folio is partially inside EOF */
 	return offset;
