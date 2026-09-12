@@ -318,6 +318,7 @@ enum io_uring_op {
 	IORING_OP_PIPE,
 	IORING_OP_NOP128,
 	IORING_OP_URING_CMD128,
+	IORING_OP_SLOT_RW,
 
 	/* this goes last, obviously */
 	IORING_OP_LAST,
@@ -493,6 +494,13 @@ enum io_uring_msg_ring_flags {
 #define IORING_NOP_FIXED_BUFFER		(1U << 3)
 #define IORING_NOP_TW			(1U << 4)
 #define IORING_NOP_CQE32		(1U << 5)
+
+/*
+ * IORING_OP_SLOT_RW flags (sqe->rw_flags)
+ *
+ * IORING_SLOT_RW_WRITE		Direction is write. Default (not set) is read.
+ */
+#define IORING_SLOT_RW_WRITE		(1U << 0)
 
 /*
  * IO completion data structure (Completion Queue Entry)
@@ -723,6 +731,10 @@ enum io_uring_register_op {
 	/* register bpf filtering programs */
 	IORING_REGISTER_BPF_FILTER		= 37,
 
+	/* register a pre-built (buf, file) IO slot, see io_uring_slot_reg */
+	IORING_REGISTER_IO_SLOT			= 38,
+	IORING_UNREGISTER_IO_SLOT		= 39,
+
 	/* this goes last */
 	IORING_REGISTER_LAST,
 
@@ -786,6 +798,17 @@ struct io_uring_rsrc_update {
 	__u32 offset;
 	__u32 resv;
 	__aligned_u64 data;
+};
+
+/*
+ * Argument to IORING_REGISTER_IO_SLOT. Slots are bidirectional
+ * (DMA_BIDIRECTIONAL); direction is per-IO via the SQE's
+ * IORING_SLOT_RW_WRITE flag.
+ */
+struct io_uring_slot_reg {
+	__u32	buf_index;	/* index into ctx->buf_table */
+	__u32	file_index;	/* index into ctx->file_table */
+	__u64	resv;
 };
 
 struct io_uring_rsrc_update2 {

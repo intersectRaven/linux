@@ -161,13 +161,22 @@ static void io_release_ubuf(void *priv)
 static struct io_mapped_ubuf *io_alloc_imu(struct io_ring_ctx *ctx,
 					   int nr_bvecs)
 {
+	struct io_mapped_ubuf *imu;
+
 	if (nr_bvecs <= IO_CACHED_BVECS_SEGS)
-		return io_cache_alloc(&ctx->imu_cache, GFP_KERNEL);
-	return kvmalloc_flex(struct io_mapped_ubuf, bvec, nr_bvecs);
+		imu = io_cache_alloc(&ctx->imu_cache, GFP_KERNEL);
+	else
+		imu = kvmalloc_flex(struct io_mapped_ubuf, bvec, nr_bvecs);
+	if (imu)
+		INIT_LIST_HEAD(&imu->dma_mappings);
+	return imu;
 }
 
 static void io_free_imu(struct io_ring_ctx *ctx, struct io_mapped_ubuf *imu)
 {
+	/* Slots pin buf_node which pins imu, "can't happen" scenario */
+	WARN_ON_ONCE(!list_empty(&imu->dma_mappings));
+
 	if (imu->nr_bvecs <= IO_CACHED_BVECS_SEGS)
 		io_cache_free(&ctx->imu_cache, imu);
 	else
@@ -1161,27 +1170,8 @@ static int io_import_fixed(int ddir, struct iov_iter *iter,
 	if (imu->flags & IO_REGBUF_F_KBUF)
 		return io_import_kbuf(ddir, iter, imu, len, offset);
 
-	/*
-	 * Don't use iov_iter_advance() here, as it's really slow for
-	 * using the latter parts of a big fixed buffer - it iterates
-	 * over each segment manually. We can cheat a bit here for user
-	 * registered nodes, because we know that:
-	 *
-	 * 1) it's a BVEC iter, we set it up
-	 * 2) all bvecs are the same in size, except potentially the
-	 *    first and last bvec
-	 */
 	folio_mask = (1UL << imu->folio_shift) - 1;
-	bvec = imu->bvec;
-	if (offset >= bvec->bv_len) {
-		unsigned long seg_skip;
-
-		/* skip first vec */
-		offset -= bvec->bv_len;
-		seg_skip = 1 + (offset >> imu->folio_shift);
-		bvec += seg_skip;
-		offset &= folio_mask;
-	}
+	bvec = io_imu_offset_to_bvec(imu, &offset);
 	nr_segs = (offset + len + bvec->bv_offset + folio_mask) >> imu->folio_shift;
 	iov_iter_bvec(iter, ddir, bvec, nr_segs, len);
 	iter->iov_offset = offset;
