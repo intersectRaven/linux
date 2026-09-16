@@ -24,6 +24,7 @@
 #include <linux/mmap_lock.h>
 #include <linux/hugetlb_inline.h>
 #include <linux/jiffies.h>
+#include <linux/math.h>
 #include <linux/mm_api.h>
 #include <linux/highmem.h>
 #include <linux/spinlock_api.h>
@@ -8304,6 +8305,7 @@ sched_balance_find_dst_group_cpu(struct sched_group *group, struct task_struct *
 {
 	unsigned long load, min_load = ULONG_MAX;
 	unsigned int min_exit_latency = UINT_MAX;
+	unsigned int nr_candidates = 0;
 	int least_loaded_cpu = this_cpu;
 	int shallowest_idle_cpu = -1;
 	int i;
@@ -8327,9 +8329,12 @@ sched_balance_find_dst_group_cpu(struct sched_group *group, struct task_struct *
 			if (idle && idle->exit_latency < min_exit_latency) {
 				min_exit_latency = idle->exit_latency;
 				shallowest_idle_cpu = i;
-			} else if ((!idle || idle->exit_latency == min_exit_latency) &&
-				   shallowest_idle_cpu == -1) {
-				shallowest_idle_cpu = i;
+				nr_candidates = 1;
+			} else if (!idle || idle->exit_latency == min_exit_latency) {
+				nr_candidates++;
+				if (nr_candidates == 1 ||
+				    !reciprocal_scale(sched_rng(), nr_candidates))
+					shallowest_idle_cpu = i;
 			}
 		} else if (shallowest_idle_cpu == -1) {
 			load = cpu_load(cpu_rq(i));
