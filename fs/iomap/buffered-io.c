@@ -1803,6 +1803,7 @@ static int iomap_folio_mkwrite_iter(struct iomap_iter *iter,
 		struct folio *folio)
 {
 	loff_t length = iomap_length(iter);
+	size_t start = iter->pos - folio_pos(folio);
 	int ret;
 
 	if (iter->iomap.flags & IOMAP_F_BUFFER_HEAD) {
@@ -1810,10 +1811,13 @@ static int iomap_folio_mkwrite_iter(struct iomap_iter *iter,
 					      &iter->iomap);
 		if (ret)
 			return ret;
-		block_commit_write(folio, 0, length);
+		block_commit_write(folio, start, length);
 	} else {
 		WARN_ON_ONCE(!folio_test_uptodate(folio));
-		folio_mark_dirty(folio);
+
+		ifs_alloc(iter->inode, folio, iter->flags);
+		iomap_set_range_dirty(folio, start, length);
+		filemap_dirty_folio(folio->mapping, folio);
 	}
 
 	return iomap_iter_advance(iter, length);
@@ -1831,10 +1835,10 @@ vm_fault_t iomap_page_mkwrite(struct vm_fault *vmf, const struct iomap_ops *ops,
 	ssize_t ret;
 
 	folio_lock(folio);
-	ret = folio_mkwrite_check_truncate(folio, iter.inode);
+	ret = page_mkwrite_max_bytes(iter.inode, folio, vmf->page);
 	if (ret < 0)
 		goto out_unlock;
-	iter.pos = folio_pos(folio);
+	iter.pos = page_pos(folio, vmf->page);
 	iter.len = ret;
 	while ((ret = iomap_iter(&iter, ops)) > 0)
 		iter.status = iomap_folio_mkwrite_iter(&iter, folio);
