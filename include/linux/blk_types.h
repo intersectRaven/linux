@@ -324,6 +324,7 @@ enum {
 	BIO_EMULATES_ZONE_APPEND, /* bio emulates a zone append operation */
 	/* Pre-validated, pre-DMA-mapped bio owned by an io_uring io_slot */
 	BIO_REGISTERED,
+	BIO_COMPLETE_IN_TASK, /* complete bi_end_io() in task context */
 	BIO_FLAG_LAST
 };
 
