@@ -60,8 +60,7 @@ vmlinux_link()
 	# skip output file argument
 	shift
 
-	if is_enabled CONFIG_LTO_CLANG || is_enabled CONFIG_X86_KERNEL_IBT ||
-	   is_enabled CONFIG_KLP_BUILD; then
+	if is_enabled CONFIG_OBJTOOL_DEFERRED || is_enabled CONFIG_LTO_CLANG; then
 		# Use vmlinux.o instead of performing the slow LTO link again.
 		objs=vmlinux.o
 		libs=
@@ -96,6 +95,11 @@ vmlinux_link()
 		ldflags="${ldflags} ${wl}--strip-debug"
 	fi
 
+	# Only the final link actually requires the relocations.
+	if [ "${output}" = "${VMLINUX}" ] && is_enabled CONFIG_ARCH_VMLINUX_NEEDS_RELOCS; then
+		ldflags="${ldflags} ${wl}--emit-relocs"
+	fi
+
 	if [ -n "${generate_map}" ];  then
 		ldflags="${ldflags} ${wl}-Map=vmlinux.map"
 	fi
@@ -106,11 +110,15 @@ vmlinux_link()
 		${kallsymso} ${btf_vmlinux_bin_o} ${arch_vmlinux_o} ${ldlibs}
 }
 
-# Create ${2}.o file with all symbols from the ${1} object file
+# Create ${2}.o with the kallsyms tables for ${1} (the vmlinux, or an empty
+# listing for the first pass); list the symbols used in ${3} if given.
 kallsyms()
 {
 	local kallsymopt;
 
+	if [ -n "${3:-}" ]; then
+		kallsymopt="--sysmap=${3}"
+	fi
 	if is_enabled CONFIG_KALLSYMS_ALL; then
 		kallsymopt="${kallsymopt} --all-symbols"
 	fi
@@ -120,7 +128,7 @@ kallsyms()
 	fi
 
 	info KSYMS "${2}.S"
-	scripts/kallsyms ${kallsymopt} "${1}" > "${2}.S"
+	scripts/kallsyms ${kallsymopt} "${1}" "${2}.bin" > "${2}.S"
 
 	info AS "${2}.o"
 	${CC} ${NOSTDINC_FLAGS} ${LINUXINCLUDE} ${KBUILD_CPPFLAGS} \
@@ -132,23 +140,20 @@ kallsyms()
 # Perform kallsyms for the given temporary vmlinux.
 sysmap_and_kallsyms()
 {
-	mksysmap "${1}" "${1}.syms"
-	kallsyms "${1}.syms" "${1}.kallsyms"
-
+	kallsyms "${1}" "${1}.kallsyms" "${1}.syms"
 	kallsyms_sysmap=${1}.syms
 }
 
 # Create map file with all symbols from ${1}
-# See mksymap for additional details
 mksysmap()
 {
-	info NM ${2}
-	${NM} -n "${1}" | sed -f "${srctree}/scripts/mksysmap" > "${2}"
+	info SYSMAP ${2}
+	scripts/kallsyms --sysmap="${2}" "${1}"
 }
 
 sorttable()
 {
-	${NM} -S ${1} > .tmp_vmlinux.nm-sort
+	${NM} -p -S ${1} > .tmp_vmlinux.nm-sort
 	${objtree}/scripts/sorttable -s .tmp_vmlinux.nm-sort ${1}
 }
 

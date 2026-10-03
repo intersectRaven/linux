@@ -40,7 +40,7 @@ KBUILD_CFLAGS			:= $(subst $(CC_FLAGS_FTRACE),,$(cflags-y)) \
 				   -D__NO_FORTIFY \
 				   -ffreestanding \
 				   -fno-stack-protector \
-				   $(call cc-option,-fno-addrsig) \
+				   $(CONFIG_CC_OPT_NO_ADDRSIG) \
 				   -D__DISABLE_EXPORTS
 
 #
@@ -154,6 +154,10 @@ STUBCOPY_RELOC-$(CONFIG_RISCV)	:= -E R_RISCV_HI20\|R_RISCV_$(BITS)\|R_RISCV_RELA
 STUBCOPY_FLAGS-$(CONFIG_LOONGARCH)	+= --prefix-alloc-sections=.init \
 					   --prefix-symbols=__efistub_
 STUBCOPY_RELOC-$(CONFIG_LOONGARCH)	:= R_LARCH_MARK_LA
+
+# Drop the section created by __ADDRESSABLE() so it doesn't get prefixed.
+# Its job is already done.
+STUBCOPY_FLAGS-y			+= --remove-section=.discard.addressable
 
 $(obj)/%.stub.o: $(obj)/%.o FORCE
 	$(call if_changed,stubcopy)

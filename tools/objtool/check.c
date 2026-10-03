@@ -7,6 +7,9 @@
 #include <fnmatch.h>
 #include <string.h>
 #include <stdlib.h>
+#include <pthread.h>
+#include <stddef.h>
+#include <unistd.h>
 #include <inttypes.h>
 #include <sys/mman.h>
 
@@ -24,6 +27,7 @@
 #include <linux/objtool_types.h>
 #include <linux/hashtable.h>
 #include <linux/kernel.h>
+#include <linux/sizes.h>
 #include <linux/static_call_types.h>
 #include <linux/string.h>
 
@@ -38,12 +42,22 @@ struct disas_context *objtool_disas_ctx;
 
 size_t sym_name_max_len;
 
+static struct hlist_head *insn_hash_head(struct objtool_file *file,
+					 struct section *sec, unsigned long offset)
+{
+	/* Determine instruction hash based on section index and offset. */
+	const u32 sec_hash = sec_offset_hash(sec, offset);
+	const u32 hash = hash_min(sec_hash, file->insn_hash_bits);
+
+	return &file->insn_hash[hash];
+}
+
 struct instruction *find_insn(struct objtool_file *file,
 			      struct section *sec, unsigned long offset)
 {
 	struct instruction *insn;
 
-	hash_for_each_possible(file->insn_hash, insn, hash, sec_offset_hash(sec, offset)) {
+	hlist_for_each_entry(insn, insn_hash_head(file, sec, offset), hash) {
 		if (insn->sec == sec && insn->offset == offset)
 			return insn;
 	}
@@ -54,14 +68,13 @@ struct instruction *find_insn(struct objtool_file *file,
 struct instruction *next_insn_same_sec(struct objtool_file *file,
 				       struct instruction *insn)
 {
-	if (insn->idx == INSN_CHUNK_MAX)
-		return find_insn(file, insn->sec, insn->offset + insn->len);
+	const unsigned long next_offset = insn->offset + insn->len;
 
-	insn++;
-	if (!insn->len)
-		return NULL;
+	/* A chunk ends at its last slot or an empty one, so look the next up. */
+	if (insn->idx == INSN_CHUNK_MAX || !insn[1].len)
+		return find_insn(file, insn->sec, next_offset);
 
-	return insn;
+	return insn + 1;
 }
 
 struct instruction *next_insn_same_func(struct objtool_file *file,
@@ -177,135 +190,277 @@ static bool is_sibling_call(struct instruction *insn)
 }
 
 /*
- * Checks if a function is a Rust "noreturn" one.
+ * Use this rather than reading sym->_noreturn directly: the noreturn status
+ * lives on the primary alias, and ANNOTATE_IGNORE_NORETURN() overrides it.
  */
-static bool is_rust_noreturn(const struct symbol *func)
+static bool is_noreturn(struct symbol *func)
 {
-	/*
-	 * If it does not start with "_R", then it is not a Rust symbol.
-	 */
-	if (strncmp(func->name, "_R", 2))
+	func = func->alias->pfunc;
+
+	if (func->ignore_noreturn)
 		return false;
 
-	/*
-	 * These are just heuristics -- we do not control the precise symbol
-	 * name, due to the crate disambiguators (which depend on the compiler)
-	 * as well as changes to the source code itself between versions (since
-	 * these come from the Rust standard library).
-	 */
-	return str_ends_with(func->name, "_4core3num20from_str_radix_panic")				||
-	       str_ends_with(func->name, "_4core3num22from_ascii_radix_panic")				||
-	       str_ends_with(func->name, "_4core3num28from_ascii_bytes_radix_panic")			||
-	       str_ends_with(func->name, "_4core3str16slice_error_fail")				||
-	       str_ends_with(func->name, "_4core5sliceSp15copy_from_slice17len_mismatch_fail")		||
-	       str_ends_with(func->name, "_4core6option13expect_failed")				||
-	       str_ends_with(func->name, "_4core6option13unwrap_failed")				||
-	       str_ends_with(func->name, "_4core6result13unwrap_failed")				||
-	       str_ends_with(func->name, "_4core9panicking5panic")					||
-	       str_ends_with(func->name, "_4core9panicking9panic_fmt")					||
-	       str_ends_with(func->name, "_4core9panicking14panic_explicit")				||
-	       str_ends_with(func->name, "_4core9panicking14panic_nounwind")				||
-	       str_ends_with(func->name, "_4core9panicking18panic_bounds_check")			||
-	       str_ends_with(func->name, "_4core9panicking18panic_nounwind_fmt")			||
-	       str_ends_with(func->name, "_4core9panicking19assert_failed_inner")			||
-	       str_ends_with(func->name, "_4core9panicking30panic_null_pointer_dereference")		||
-	       str_ends_with(func->name, "_4core9panicking32panic_null_reference_constructed")		||
-	       str_ends_with(func->name, "_4core9panicking36panic_misaligned_pointer_dereference")	||
-	       str_ends_with(func->name, "_7___rustc17rust_begin_unwind")				||
-	       strstr(func->name, "_4core9panicking13assert_failed")					||
-	       strstr(func->name, "_4core9panicking11panic_const24panic_const_")			||
-	       (strstr(func->name, "_4core5slice5index") &&
-		strstr(func->name, "slice_") &&
-		str_ends_with(func->name, "_fail"));
+	return func->_noreturn;
 }
 
-/*
- * This checks to see if the given function is a "noreturn" function.
- *
- * For global functions which are outside the scope of this object file, we
- * have to keep a manual list of them.
- *
- * For local functions, we have to detect them manually by simply looking for
- * the lack of a return instruction.
- */
-static bool __dead_end_function(struct objtool_file *file, struct symbol *func,
-				int recursion)
+static bool might_return(struct objtool_file *file, struct symbol *func)
 {
-	int i;
 	struct instruction *insn;
-	bool empty = true;
+	struct symbol *dest;
 
-#define NORETURN(func) __stringify(func),
-	static const char * const global_noreturns[] = {
-#include "noreturns.h"
-	};
-#undef NORETURN
-
-	if (!func)
-		return false;
-
-	if (!is_local_sym(func)) {
-		if (is_rust_noreturn(func))
+	func_for_each_insn(file, func, insn) {
+		if (insn->type == INSN_RETURN)
 			return true;
 
-		for (i = 0; i < ARRAY_SIZE(global_noreturns); i++)
-			if (!strcmp(func->name, global_noreturns[i]))
+		if (!is_sibling_call(insn)) {
+			/*
+			 * Assume a jump into a non-function eventually returns
+			 * to the original caller one way or another, e.g., the
+			 * jump in srso_alias_untrain_ret().
+			 *
+			 * .altinstr_aux is an exception, cpu_feature_enabled()
+			 * jumps there and then right back.
+			 */
+			if (is_static_jump(insn) && insn->jump_dest &&
+			    !insn_func(insn->jump_dest) &&
+			    strcmp(insn->jump_dest->sec->name, ".altinstr_aux"))
 				return true;
+
+			continue;
+		}
+
+		dest = insn_call_dest(insn);
+		if (!dest || !is_noreturn(dest))
+			return true;
 	}
 
-	if (is_weak_sym(func))
-		return false;
+	return false;
+}
 
-	if (!func->len)
+static bool is_noreturn_candidate(struct objtool_file *file, struct symbol *func)
+{
+	struct instruction *insn;
+
+	if (!is_func_sym(func) || is_undef_sym(func) ||
+	    is_prefix_func(func) || func->embedded_insn ||
+	    func != func->alias->pfunc)
 		return false;
 
 	insn = find_insn(file, func->sec, func->offset);
-	if (!insn || !insn_func(insn))
+	if (!insn || insn_func(insn) != func)
 		return false;
-
-	func_for_each_insn(file, func, insn) {
-		empty = false;
-
-		if (insn->type == INSN_RETURN)
-			return false;
-	}
-
-	if (empty)
-		return false;
-
-	/*
-	 * A function can have a sibling call instead of a return.  In that
-	 * case, the function's dead-end status depends on whether the target
-	 * of the sibling call returns.
-	 */
-	func_for_each_insn(file, func, insn) {
-		if (is_sibling_call(insn)) {
-			struct instruction *dest = insn->jump_dest;
-
-			if (!dest)
-				/* sibling call to another file */
-				return false;
-
-			/* local sibling call */
-			if (recursion == 5) {
-				/*
-				 * Infinite recursion: two functions have
-				 * sibling calls to each other.  This is a very
-				 * rare case.  It means they aren't dead ends.
-				 */
-				return false;
-			}
-
-			return __dead_end_function(file, insn_func(dest), recursion+1);
-		}
-	}
 
 	return true;
 }
 
-static bool dead_end_function(struct objtool_file *file, struct symbol *func)
+static void detect_noreturns(struct objtool_file *file)
 {
-	return __dead_end_function(file, func, 0);
+	struct symbol *func, *dest;
+	struct instruction *insn;
+	bool changed;
+
+	/* Mark all functions guilty until proven innocent */
+	for_each_sym(file->elf, func) {
+		if (!is_noreturn_candidate(file, func))
+			continue;
+
+		func->_noreturn = 1;
+	}
+
+	/*
+	 * A function's noreturn status depends on those of its sibling call
+	 * destinations, which may not be settled yet.  Keep clearing the
+	 * noreturn bit for known cases until it stops spreading.
+	 */
+	do {
+		changed = false;
+
+		for_each_sym(file->elf, func) {
+			if (!func->_noreturn || !might_return(file, func))
+				continue;
+
+			func->_noreturn = 0;
+			changed = true;
+		}
+	} while (changed);
+
+	/* Now mark the dead end call sites */
+	for_each_insn(file, insn) {
+		if (insn->type != INSN_CALL)
+			continue;
+
+		dest = insn_call_dest(insn);
+		if (dest && is_noreturn(dest))
+			insn->dead_end = true;
+	}
+}
+
+static bool noreturns_changed(const char *buf, size_t len)
+{
+	bool changed = true;
+	char *old = NULL;
+	FILE *fp;
+
+	fp = fopen(opts.noreturns_write, "r");
+	if (!fp)
+		return true;
+
+	old = malloc(len + 1);
+	if (!old)
+		goto out;
+
+	if (fread(old, 1, len + 1, fp) != len)
+		goto out;
+
+	if (memcmp(old, buf, len))
+		goto out;
+
+	changed = false;
+
+out:
+	free(old);
+	fclose(fp);
+	return changed;
+}
+
+/*
+ * This is called for vmlinux.o.  Write the vmlinux.o noreturn list to a file
+ * so it can be read in module objtool runs by read_noreturns().
+ */
+static int write_noreturns(struct objtool_file *file)
+{
+	struct symbol *func;
+	char *buf, *pos;
+	size_t len = 0;
+	FILE *fp;
+
+	for_each_sym(file->elf, func) {
+		if (is_noreturn(func) && func->exported)
+			len += strlen(func->name) + 1;
+	}
+
+	buf = malloc(len + 1);
+	if (!buf) {
+		ERROR_GLIBC("malloc");
+		return -1;
+	}
+
+	pos = buf;
+	for_each_sym(file->elf, func) {
+		if (is_noreturn(func) && func->exported)
+			pos += sprintf(pos, "%s\n", func->name);
+	}
+
+	/*
+	 * Only write the file when the contents have change to avoid relinking
+	 * all the modules unnecessarily.
+	 */
+	if (!noreturns_changed(buf, len)) {
+		free(buf);
+		return 0;
+	}
+
+	fp = fopen(opts.noreturns_write, "w");
+	if (!fp) {
+		ERROR_GLIBC("fopen");
+		return -1;
+	}
+
+	if (fwrite(buf, 1, len, fp) != len) {
+		ERROR_GLIBC("fwrite");
+		return -1;
+	}
+
+	free(buf);
+
+	if (fclose(fp)) {
+		ERROR_GLIBC("fclose");
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * This is called for modules.  Read the noreturn list generated by the
+ * vmlinux.o pass and mark the corresponding undefined symbols noreturn.
+ */
+static int read_noreturns(struct objtool_file *file)
+{
+	char line[SYM_NAME_LEN];
+	struct symbol *func;
+	FILE *fp;
+
+	fp = fopen(opts.noreturns_read, "r");
+	if (!fp) {
+		ERROR("can't open '%s'", opts.noreturns_read);
+		return -1;
+	}
+
+	while (fgets(line, sizeof(line), fp)) {
+		line[strcspn(line, "\n")] = '\0';
+
+		func = find_global_symbol_by_name(file->elf, line);
+		if (func && is_undef_sym(func))
+			func->_noreturn = 1;
+	}
+
+	fclose(fp);
+	return 0;
+}
+
+static void read_annotate_noreturn(struct objtool_file *file)
+{
+	struct section *sec;
+	struct symbol *func;
+	unsigned long off;
+	const char *name;
+
+	sec = find_section_by_name(file->elf, ".discard.annotate_noreturn");
+	if (!sec || !sec->data)
+		return;
+
+	for (off = 0; off < sec_size(sec); off += strlen(name) + 1) {
+		name = sec->data->d_buf + off;
+		if (!*name)
+			continue;
+
+		func = find_global_symbol_by_name(file->elf, name);
+		if (!func)
+			continue;
+
+		if (is_undef_sym(func))
+			func->_noreturn = 1;
+
+		func->annotate_noreturn = 1;
+	}
+}
+
+static int validate_noreturns(struct objtool_file *file)
+{
+	struct symbol *func;
+	int warnings = 0;
+
+	for_each_sym(file->elf, func) {
+		if (!is_noreturn_candidate(file, func))
+			continue;
+
+		if (opts.module && is_noreturn(func) && func->exported &&
+		    !func->annotate_noreturn) {
+			WARN("%s() is exported and noreturn, its declaration needs __noreturn and ANNOTATE_EXPORTED_NORETURN()",
+			     func->name);
+			warnings++;
+		}
+
+		if (func->annotate_noreturn && !func->ignore_noreturn &&
+		    !is_noreturn(func)) {
+			WARN("%s() has ANNOTATE_EXPORTED_NORETURN() but returns",
+			     func->name);
+			warnings++;
+		}
+	}
+
+	return warnings;
 }
 
 static void init_cfi_state(struct cfi_state *cfi)
@@ -403,21 +558,394 @@ static void *cfi_hash_alloc(unsigned long size)
 static unsigned long nr_insns;
 static unsigned long nr_insns_visited;
 
+/* Only the vmlinux.o link, and only if it is this large, runs on several threads. */
+#define DECODE_THREADED_MIN_TEXT	SZ_8M
+/* Only decoding and the branch passes are threaded, so more gains nothing. */
+#define DECODE_MAX_THREADS		16
+#define DECODE_RANGES_PER_THREAD	4
+
+/*
+ * sec_offset_hash() keys on OFFSET_STRIDE windows, so the instructions of a
+ * window share a chain and buckets beyond one per window would sit empty.
+ */
+#define INSN_HASH_BYTES_PER_BUCKET	OFFSET_STRIDE
+#define INSN_HASH_MIN_BITS		10
+
+static unsigned long total_text_size(struct objtool_file *file)
+{
+	unsigned long size = 0;
+	struct section *sec;
+
+	for_each_sec(file->elf, sec)
+		if (is_text_sec(sec))
+			size += sec_size(sec);
+
+	return size;
+}
+
+static int alloc_insn_hash(struct objtool_file *file, unsigned long text_size)
+{
+	const unsigned long nr_buckets = text_size / INSN_HASH_BYTES_PER_BUCKET;
+	const int bits = ilog2(nr_buckets);
+
+	file->insn_hash_bits = max(INSN_HASH_MIN_BITS, bits);
+	file->insn_hash = calloc(1UL << file->insn_hash_bits,
+				 sizeof(*file->insn_hash));
+	if (!file->insn_hash) {
+		ERROR_GLIBC("calloc");
+		return -1;
+	}
+
+	if (opts.stats)
+		printf("insn_hash_bits: %d\n", file->insn_hash_bits);
+
+	return 0;
+}
+
+/* Per-thread state, only instruction hash is shared. */
+struct insn_range {
+	struct section *sec;
+	unsigned long start, end;
+	struct instruction *first, *last;
+	unsigned long nr_insns;
+	int ret;
+
+	/*
+	 * Each thread writes to its own copy of an objtool file, which are
+	 * combined upon completion.
+	 */
+	struct objtool_file shadow;
+};
+
+#define range_for_each_insn(file, range, insn)				\
+	for (insn = (range)->first;					\
+	     insn && insn->offset < (range)->end;			\
+	     insn = next_insn_same_sec(file, insn))
+
+typedef int (*range_fn_t)(struct objtool_file *file, struct insn_range *range);
+
+struct range_work {
+	range_fn_t fn;
+};
+
+static struct insn_range *decode_ranges;
+static unsigned int nr_decode_ranges, next_decode_range, nr_decode_threads;
+
+/* The kernel's try_cmpxchg(); the tools' cmpxchg() is host-arch only. */
+static bool hlist_try_cmpxchg(struct hlist_node **ptr, struct hlist_node **old,
+			      struct hlist_node *new)
+{
+	struct hlist_node *seen = __sync_val_compare_and_swap(ptr, *old, new);
+
+	if (seen == *old)
+		return true;
+
+	*old = seen;
+	return false;
+}
+
+/* Nothing is ever removed, so push onto the bucket as llist_add() does. */
+static void insn_hash_add(struct objtool_file *file, struct instruction *insn)
+{
+	struct hlist_head *head = insn_hash_head(file, insn->sec, insn->offset);
+	struct hlist_node *first = READ_ONCE(head->first);
+
+	insn->hash.pprev = &head->first;
+	do {
+		insn->hash.next = first;
+	} while (!hlist_try_cmpxchg(&head->first, &first, &insn->hash));
+}
+
+/* The slot after prev in its chunk, or the first of a new chunk. */
+static struct instruction *next_insn_slot(struct instruction *prev)
+{
+	struct instruction *insn;
+
+	if (prev && prev->idx < INSN_CHUNK_MAX) {
+		insn = prev + 1;
+		insn->idx = prev->idx + 1;
+		return insn;
+	}
+
+	insn = calloc(INSN_CHUNK_SIZE, sizeof(*insn));
+	if (!insn)
+		ERROR_GLIBC("calloc");
+
+	return insn;
+}
+
+static int decode_range(struct objtool_file *file, struct insn_range *range)
+{
+	struct instruction *insn = NULL;
+	struct section *sec = range->sec;
+	unsigned long offset;
+	u8 prev_len = 0;
+
+	for (offset = range->start; offset < range->end; offset += insn->len) {
+		const unsigned long remaining = sec_size(sec) - offset;
+
+		insn = next_insn_slot(insn);
+		if (!insn)
+			return -1;
+
+		INIT_LIST_HEAD(&insn->call_node);
+		insn->sec = sec;
+		insn->offset = offset;
+		insn->prev_len = prev_len;
+
+		if (arch_decode_instruction(file, sec, offset, remaining, insn))
+			return -1;
+
+		prev_len = insn->len;
+
+		if (insn->type == INSN_BUG)
+			insn->dead_end = true;
+
+		insn_hash_add(file, insn);
+		if (!range->first)
+			range->first = insn;
+		range->nr_insns++;
+	}
+	range->last = insn;
+
+	/* The range ends at a function symbol, so decoding must land on it. */
+	if (offset != range->end) {
+		ERROR("%s: no instruction boundary at %s", sec->name,
+		      offstr(sec, range->end));
+		return -1;
+	}
+
+	return 0;
+}
+
+static int run_threads(void *(*fn)(void *), void *arg, unsigned int nr_threads)
+{
+	unsigned int nr_started, i;
+	pthread_t *threads;
+	int ret = 0;
+
+	if (nr_threads <= 1) {
+		fn(arg);
+		return 0;
+	}
+
+	threads = calloc(nr_threads, sizeof(*threads));
+	if (!threads) {
+		ERROR_GLIBC("calloc");
+		return -1;
+	}
+
+	for (nr_started = 0; nr_started < nr_threads; nr_started++) {
+		if (pthread_create(&threads[nr_started], NULL, fn, arg)) {
+			ERROR_GLIBC("pthread_create");
+			ret = -1;
+			break;
+		}
+	}
+
+	for (i = 0; i < nr_started; i++)
+		pthread_join(threads[i], NULL);
+
+	free(threads);
+	return ret;
+}
+
+/* Hand out the ranges one at a time, or NULL once they are all taken. */
+static struct insn_range *claim_decode_range(void)
+{
+	const unsigned int idx = __sync_fetch_and_add(&next_decode_range, 1);
+
+	return idx < nr_decode_ranges ? &decode_ranges[idx] : NULL;
+}
+
+static void *range_worker(void *arg)
+{
+	const struct range_work *work = arg;
+	struct insn_range *range;
+
+	while ((range = claim_decode_range()))
+		range->ret = work->fn(&range->shadow, range);
+
+	return NULL;
+}
+
+/* The lists in the objtool_file that the passes add instructions to. */
+static const size_t shadow_list_offsets[] = {
+	offsetof(struct objtool_file, retpoline_call_list),
+	offsetof(struct objtool_file, return_thunk_list),
+	offsetof(struct objtool_file, static_call_list),
+	offsetof(struct objtool_file, mcount_loc_list),
+	offsetof(struct objtool_file, endbr_list),
+	offsetof(struct objtool_file, call_list),
+};
+
+static struct list_head *shadow_list(struct objtool_file *file,
+				     unsigned int idx)
+{
+	return (void *)file + shadow_list_offsets[idx];
+}
+
+static void init_range_shadow(struct objtool_file *file,
+			      struct insn_range *range)
+{
+	unsigned int i;
+
+	range->shadow = *file;
+	range->ret = 0;
+	for (i = 0; i < ARRAY_SIZE(shadow_list_offsets); i++)
+		INIT_LIST_HEAD(shadow_list(&range->shadow, i));
+}
+
+/* Joined in range order, which is the order a single walk would produce. */
+static int join_range_shadow(struct objtool_file *file,
+			     struct insn_range *range)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(shadow_list_offsets); i++)
+		list_splice_tail(shadow_list(&range->shadow, i),
+				 shadow_list(file, i));
+
+	return range->ret;
+}
+
+/* Run a pass over the instructions, one range per thread at a time. */
+static int run_insn_ranges(struct objtool_file *file, range_fn_t fn)
+{
+	struct range_work work = { .fn = fn };
+	unsigned int i;
+	int ret = 0;
+
+	for (i = 0; i < nr_decode_ranges; i++)
+		init_range_shadow(file, &decode_ranges[i]);
+	next_decode_range = 0;
+
+	if (run_threads(range_worker, &work, nr_decode_threads))
+		return -1;
+
+	for (i = 0; i < nr_decode_ranges; i++) {
+		if (join_range_shadow(file, &decode_ranges[i]))
+			ret = -1;
+	}
+
+	return ret;
+}
+
+static int add_decode_range(struct section *sec, unsigned long start,
+			    unsigned long end)
+{
+	const size_t size = (nr_decode_ranges + 1) * sizeof(*decode_ranges);
+	struct insn_range *range;
+
+	decode_ranges = realloc(decode_ranges, size);
+	if (!decode_ranges) {
+		ERROR_GLIBC("realloc");
+		return -1;
+	}
+
+	range = &decode_ranges[nr_decode_ranges++];
+	memset(range, 0, sizeof(*range));
+	range->sec = sec;
+	range->start = start;
+	range->end = end;
+
+	return 0;
+}
+
+/* Split a section into ranges of roughly range_size, at function starts. */
+static int add_decode_ranges(struct section *sec, unsigned long range_size)
+{
+	const unsigned long size = sec_size(sec);
+	unsigned long start = 0;
+	struct symbol *sym;
+
+	if (!range_size)
+		return add_decode_range(sec, 0, size);
+
+	sec_for_each_sym(sec, sym) {
+		if (!is_func_sym(sym) || sym->offset <= start ||
+		    sym->offset >= size)
+			continue;
+		if (sym->offset - start < range_size)
+			continue;
+
+		if (add_decode_range(sec, start, sym->offset))
+			return -1;
+		start = sym->offset;
+	}
+
+	return add_decode_range(sec, start, size);
+}
+
+static void free_decode_ranges(void)
+{
+	free(decode_ranges);
+	decode_ranges = NULL;
+	nr_decode_ranges = 0;
+	next_decode_range = 0;
+}
+
+/* A range's first instruction follows the last of the range before it. */
+static void link_decode_ranges(void)
+{
+	unsigned int i;
+
+	for (i = 1; i < nr_decode_ranges; i++) {
+		const struct insn_range *prev = &decode_ranges[i - 1];
+		struct insn_range *range = &decode_ranges[i];
+
+		if (prev->sec != range->sec || !prev->last || !range->first)
+			continue;
+
+		range->first->prev_len = prev->last->len;
+	}
+}
+
+static unsigned int decode_threads(unsigned long text_size)
+{
+	const long nr_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+
+	/* Modules are processed inside the parallel build, on one thread. */
+	if (!opts.link || opts.module)
+		return 1;
+	if (text_size < DECODE_THREADED_MIN_TEXT || nr_cpus < 2)
+		return 1;
+
+	return min_t(unsigned int, nr_cpus, DECODE_MAX_THREADS);
+}
+
+/* Several ranges per thread so uneven ones balance out; 0 means per section. */
+static unsigned long decode_range_size(unsigned long text_size,
+				       unsigned int nr_threads)
+{
+	const unsigned int nr_ranges = nr_threads * DECODE_RANGES_PER_THREAD;
+
+	if (nr_threads <= 1)
+		return 0;
+
+	return text_size / nr_ranges;
+}
+
 /*
  * Call the arch-specific instruction decoder for all the instructions and add
  * them to the global instruction list.
  */
 static int decode_instructions(struct objtool_file *file)
 {
+	const unsigned long text_size = total_text_size(file);
+	unsigned long range_size;
+	struct instruction *insn;
 	struct section *sec;
 	struct symbol *func;
-	unsigned long offset;
-	struct instruction *insn;
+	unsigned int i;
+
+	if (alloc_insn_hash(file, text_size))
+		return -1;
+
+	nr_decode_threads = decode_threads(text_size);
+	range_size = decode_range_size(text_size, nr_decode_threads);
 
 	for_each_sec(file->elf, sec) {
-		struct instruction *insns = NULL;
-		u8 prev_len = 0;
-		u8 idx = 0;
 
 		if (!is_text_sec(sec))
 			continue;
@@ -442,41 +970,20 @@ static int decode_instructions(struct objtool_file *file)
 		if (!strcmp(sec->name, ".init.text") && !opts.module)
 			sec->init = true;
 
-		for (offset = 0; offset < sec_size(sec); offset += insn->len) {
-			if (!insns || idx == INSN_CHUNK_MAX) {
-				insns = calloc(INSN_CHUNK_SIZE, sizeof(*insn));
-				if (!insns) {
-					ERROR_GLIBC("calloc");
-					return -1;
-				}
-				idx = 0;
-			} else {
-				idx++;
-			}
-			insn = &insns[idx];
-			insn->idx = idx;
+		if (add_decode_ranges(sec, range_size))
+			return -1;
+	}
 
-			INIT_LIST_HEAD(&insn->call_node);
-			insn->sec = sec;
-			insn->offset = offset;
-			insn->prev_len = prev_len;
+	if (run_insn_ranges(file, decode_range))
+		return -1;
 
-			if (arch_decode_instruction(file, sec, offset, sec_size(sec) - offset, insn))
-				return -1;
+	for (i = 0; i < nr_decode_ranges; i++)
+		nr_insns += decode_ranges[i].nr_insns;
+	link_decode_ranges();
 
-			prev_len = insn->len;
-
-			/*
-			 * By default, "ud2" is a dead end unless otherwise
-			 * annotated, because GCC 7 inserts it for certain
-			 * divide-by-zero cases.
-			 */
-			if (insn->type == INSN_BUG)
-				insn->dead_end = true;
-
-			hash_add(file->insn_hash, &insn->hash, sec_offset_hash(sec, insn->offset));
-			nr_insns++;
-		}
+	for_each_sec(file->elf, sec) {
+		if (!is_text_sec(sec))
+			continue;
 
 		sec_for_each_sym(sec, func) {
 			if (!is_notype_sym(func) && !is_func_sym(func))
@@ -1421,9 +1928,6 @@ static int annotate_call_site(struct objtool_file *file,
 	    !insn->_call_dest->embedded_insn)
 		list_add_tail(&insn->call_node, &file->call_list);
 
-	if (!sibling && dead_end_function(file, sym))
-		insn->dead_end = true;
-
 	return 0;
 }
 
@@ -1519,131 +2023,145 @@ static bool is_first_func_insn(struct objtool_file *file,
 /*
  * Find the destination instructions for all jumps.
  */
-static int add_jump_destinations(struct objtool_file *file)
+static int add_jump_destination(struct objtool_file *file, struct instruction *insn)
 {
-	struct instruction *insn;
 	struct reloc *reloc;
+	struct symbol *func = insn_func(insn);
+	struct instruction *dest_insn;
+	struct section *dest_sec;
+	struct symbol *dest_sym;
+	unsigned long dest_off;
 
-	for_each_insn(file, insn) {
-		struct symbol *func = insn_func(insn);
-		struct instruction *dest_insn;
-		struct section *dest_sec;
-		struct symbol *dest_sym;
-		unsigned long dest_off;
+	if (!is_static_jump(insn))
+		return 0;
 
-		if (!is_static_jump(insn))
-			continue;
+	if (insn->jump_dest) {
+		/*
+		 * handle_group_alt() may have previously set
+		 * 'jump_dest' for some alternatives.
+		 */
+		return 0;
+	}
 
-		if (insn->jump_dest) {
-			/*
-			 * handle_group_alt() may have previously set
-			 * 'jump_dest' for some alternatives.
-			 */
-			continue;
-		}
-
-		reloc = insn_reloc(file, insn);
-		if (!reloc) {
-			dest_sec = insn->sec;
-			dest_off = arch_jump_destination(insn);
-			dest_sym = dest_sec->sym;
-		} else {
-			dest_sym = reloc->sym;
-			if (is_undef_sym(dest_sym)) {
-				if (dest_sym->retpoline_thunk) {
-					if (add_retpoline_call(file, insn))
-						return -1;
-					continue;
-				}
-
-				if (dest_sym->return_thunk) {
-					add_return_call(file, insn, true);
-					continue;
-				}
-
-				/* External symbol */
-				if (func) {
-					/* External sibling call */
-					if (add_call_dest(file, insn, dest_sym, true))
-						return -1;
-					continue;
-				}
-
-				/* Non-func asm code jumping to external symbol */
-				continue;
+	reloc = insn_reloc(file, insn);
+	if (!reloc) {
+		dest_sec = insn->sec;
+		dest_off = arch_jump_destination(insn);
+		dest_sym = dest_sec->sym;
+	} else {
+		dest_sym = reloc->sym;
+		if (is_undef_sym(dest_sym)) {
+			if (dest_sym->retpoline_thunk) {
+				if (add_retpoline_call(file, insn))
+					return -1;
+				return 0;
 			}
 
-			dest_sec = dest_sym->sec;
-			dest_off = dest_sym->offset + arch_insn_adjusted_addend(insn, reloc);
-		}
-
-		dest_insn = find_insn(file, dest_sec, dest_off);
-		if (!dest_insn) {
-			struct symbol *sym = find_symbol_by_offset(dest_sec, dest_off);
-
-			/*
-			 * retbleed_untrain_ret() jumps to
-			 * __x86_return_thunk(), but objtool can't find
-			 * the thunk's starting RET instruction,
-			 * because the RET is also in the middle of
-			 * another instruction.  Objtool only knows
-			 * about the outer instruction.
-			 */
-			if (sym && sym->embedded_insn) {
-				add_return_call(file, insn, false);
-				continue;
+			if (dest_sym->return_thunk) {
+				add_return_call(file, insn, true);
+				return 0;
 			}
 
-			/*
-			 * GCOV/KCOV dead code can jump to the end of
-			 * the function/section.
-			 */
-			if (file->ignore_unreachables && func &&
-			    dest_sec == insn->sec &&
-			    dest_off == func->offset + func->len)
-				continue;
+			/* External symbol */
+			if (func) {
+				/* External sibling call */
+				if (add_call_dest(file, insn, dest_sym, true))
+					return -1;
+				return 0;
+			}
 
-			ERROR_INSN(insn, "can't find jump dest instruction at %s",
-				   offstr(dest_sec, dest_off));
-			return -1;
+			/* Non-func asm code jumping to external symbol */
+			return 0;
 		}
 
-		if (!dest_sym || is_sec_sym(dest_sym)) {
-			dest_sym = insn_sym(dest_insn);
-			if (!dest_sym)
-				goto set_jump_dest;
-		}
+		dest_sec = dest_sym->sec;
+		dest_off = dest_sym->offset + arch_insn_adjusted_addend(insn, reloc);
+	}
 
-		if (dest_sym->retpoline_thunk && dest_insn->offset == dest_sym->offset) {
-			if (add_retpoline_call(file, insn))
-				return -1;
-			continue;
-		}
-
-		if (dest_sym->return_thunk && dest_insn->offset == dest_sym->offset) {
-			add_return_call(file, insn, true);
-			continue;
-		}
-
-		if (!insn_sym(insn) || insn_sym(insn)->pfunc == dest_sym->pfunc)
-			goto set_jump_dest;
+	dest_insn = find_insn(file, dest_sec, dest_off);
+	if (!dest_insn) {
+		struct symbol *sym = find_symbol_by_offset(dest_sec, dest_off);
 
 		/*
-		 * Internal cross-function jump.
+		 * retbleed_untrain_ret() jumps to
+		 * __x86_return_thunk(), but objtool can't find
+		 * the thunk's starting RET instruction,
+		 * because the RET is also in the middle of
+		 * another instruction.  Objtool only knows
+		 * about the outer instruction.
 		 */
-
-		if (is_first_func_insn(file, dest_insn)) {
-			/* Internal sibling call */
-			if (add_call_dest(file, insn, dest_sym, true))
-				return -1;
-			continue;
+		if (sym && sym->embedded_insn) {
+			add_return_call(file, insn, false);
+			return 0;
 		}
 
+		/*
+		 * GCOV/KCOV dead code can jump to the end of
+		 * the function/section.
+		 */
+		if (file->ignore_unreachables && func &&
+		    dest_sec == insn->sec &&
+		    dest_off == func->offset + func->len)
+			return 0;
+
+		ERROR_INSN(insn, "can't find jump dest instruction at %s",
+			   offstr(dest_sec, dest_off));
+		return -1;
+	}
+
+	if (!dest_sym || is_sec_sym(dest_sym)) {
+		dest_sym = insn_sym(dest_insn);
+		if (!dest_sym)
+			goto set_jump_dest;
+	}
+
+	if (dest_sym->retpoline_thunk && dest_insn->offset == dest_sym->offset) {
+		if (add_retpoline_call(file, insn))
+			return -1;
+		return 0;
+	}
+
+	if (dest_sym->return_thunk && dest_insn->offset == dest_sym->offset) {
+		add_return_call(file, insn, true);
+		return 0;
+	}
+
+	if (!insn_sym(insn) || insn_sym(insn)->pfunc == dest_sym->pfunc)
+		goto set_jump_dest;
+
+	/*
+	 * Internal cross-function jump.
+	 */
+
+	if (is_first_func_insn(file, dest_insn)) {
+		/* Internal sibling call */
+		if (add_call_dest(file, insn, dest_sym, true))
+			return -1;
+		return 0;
+	}
+
 set_jump_dest:
-		insn->jump_dest = dest_insn;
+	insn->jump_dest = dest_insn;
+
+	return 0;
+}
+
+static int add_jump_destinations_range(struct objtool_file *file,
+				       struct insn_range *range)
+{
+	struct instruction *insn;
+
+	range_for_each_insn(file, range, insn) {
+		if (add_jump_destination(file, insn))
+			return -1;
 	}
 
 	return 0;
+}
+
+static int add_jump_destinations(struct objtool_file *file)
+{
+	return run_insn_ranges(file, add_jump_destinations_range);
 }
 
 static struct symbol *find_call_destination(struct section *sec, unsigned long offset)
@@ -1660,59 +2178,82 @@ static struct symbol *find_call_destination(struct section *sec, unsigned long o
 /*
  * Find the destination instructions for all calls.
  */
-static int add_call_destinations(struct objtool_file *file)
+static int add_call_destination(struct objtool_file *file, struct instruction *insn)
 {
-	struct instruction *insn;
 	unsigned long dest_off;
 	struct symbol *dest;
 	struct reloc *reloc;
+	struct symbol *func = insn_func(insn);
 
-	for_each_insn(file, insn) {
-		struct symbol *func = insn_func(insn);
-		if (insn->type != INSN_CALL)
-			continue;
+	if (insn->type != INSN_CALL)
+		return 0;
 
-		reloc = insn_reloc(file, insn);
-		if (!reloc) {
-			dest_off = arch_jump_destination(insn);
-			dest = find_call_destination(insn->sec, dest_off);
+	reloc = insn_reloc(file, insn);
+	if (!reloc) {
+		dest_off = arch_jump_destination(insn);
+		dest = find_call_destination(insn->sec, dest_off);
 
-			if (add_call_dest(file, insn, dest, false))
-				return -1;
+		if (add_call_dest(file, insn, dest, false))
+			return -1;
 
-			if (func && func->ignore)
-				continue;
+		if (func && func->ignore)
+			return 0;
 
-			if (!insn_call_dest(insn)) {
-				ERROR_INSN(insn, "unannotated intra-function call");
-				return -1;
-			}
-
-			if (func && !is_func_sym(insn_call_dest(insn))) {
-				ERROR_INSN(insn, "unsupported call to non-function");
-				return -1;
-			}
-
-		} else if (is_sec_sym(reloc->sym)) {
-			dest_off = arch_insn_adjusted_addend(insn, reloc);
-			dest = find_call_destination(reloc->sym->sec, dest_off);
-			if (!dest) {
-				ERROR_INSN(insn, "can't find call dest symbol at %s+0x%lx",
-					   reloc->sym->sec->name, dest_off);
-				return -1;
-			}
-
-			if (add_call_dest(file, insn, dest, false))
-				return -1;
-
-		} else if (reloc->sym->retpoline_thunk) {
-			if (add_retpoline_call(file, insn))
-				return -1;
-
-		} else {
-			if (add_call_dest(file, insn, reloc->sym, false))
-				return -1;
+		if (!insn_call_dest(insn)) {
+			ERROR_INSN(insn, "unannotated intra-function call");
+			return -1;
 		}
+
+		if (func && !is_func_sym(insn_call_dest(insn))) {
+			ERROR_INSN(insn, "unsupported call to non-function");
+			return -1;
+		}
+
+	} else if (is_sec_sym(reloc->sym)) {
+		dest_off = arch_insn_adjusted_addend(insn, reloc);
+		dest = find_call_destination(reloc->sym->sec, dest_off);
+		if (!dest) {
+			ERROR_INSN(insn, "can't find call dest symbol at %s+0x%lx",
+				   reloc->sym->sec->name, dest_off);
+			return -1;
+		}
+
+		if (add_call_dest(file, insn, dest, false))
+			return -1;
+
+	} else if (reloc->sym->retpoline_thunk) {
+		if (add_retpoline_call(file, insn))
+			return -1;
+
+	} else {
+		if (add_call_dest(file, insn, reloc->sym, false))
+			return -1;
+	}
+
+	return 0;
+}
+
+static int add_call_destinations_range(struct objtool_file *file,
+				       struct insn_range *range)
+{
+	struct instruction *insn;
+
+	range_for_each_insn(file, range, insn) {
+		if (add_call_destination(file, insn))
+			return -1;
+	}
+
+	return 0;
+}
+
+/* Serial: annotating a call site rewrites instructions the dead end walks read. */
+static int add_call_destinations(struct objtool_file *file)
+{
+	unsigned int i;
+
+	for (i = 0; i < nr_decode_ranges; i++) {
+		if (add_call_destinations_range(file, &decode_ranges[i]))
+			return -1;
 	}
 
 	return 0;
@@ -2208,6 +2749,24 @@ static int add_jump_table_alts(struct objtool_file *file)
 	return 0;
 }
 
+static void read_exports(struct objtool_file *file)
+{
+	struct section *sec;
+	struct symbol *func;
+	struct reloc *reloc;
+
+	sec = find_section_by_name(file->elf, ".export_symbol");
+	if (!sec || !sec->rsec)
+		return;
+
+	for_each_reloc(sec->rsec, reloc) {
+		func = find_func_by_offset(reloc->sym->sec,
+					   reloc->sym->offset + reloc_addend(reloc));
+		if (func)
+			func->exported = 1;
+	}
+}
+
 static void set_func_state(struct cfi_state *state)
 {
 	state->cfa = initial_func_cfi.cfa;
@@ -2375,6 +2934,18 @@ static int __annotate_early(struct objtool_file *file, int type, struct instruct
 		insn->noendbr = 1;
 		break;
 
+	/* Must be before detect_noreturns() */
+	case ANNOTYPE_IGNORE_NORETURN: {
+		struct symbol *sym = insn_sym(insn);
+
+		if (!sym) {
+			ERROR_INSN(insn, "dodgy IGNORE_NORETURN annotation");
+			return -1;
+		}
+		sym->ignore_noreturn = 1;
+		break;
+	}
+
 	default:
 		break;
 	}
@@ -2418,6 +2989,10 @@ static int __annotate_late(struct objtool_file *file, int type, struct instructi
 
 	switch (type) {
 	case ANNOTYPE_NOENDBR:
+		/* early */
+		break;
+
+	case ANNOTYPE_IGNORE_NORETURN:
 		/* early */
 		break;
 
@@ -2668,6 +3243,19 @@ int decode_file(struct objtool_file *file)
 	if (add_jump_table_alts(file))
 		return -1;
 
+	/*
+	 * Must be after add_jump_table_alts(), which affects sibling call
+	 * detection (jump table branches vs indirect sibling calls).
+	 *
+	 * The dead end marks are read by validate_branch() -- reached from
+	 * both validate_functions() and validate_noinstr_sections() -- and by
+	 * validate_unret().
+	 */
+	if (validate_branch_enabled() || opts.noinstr || opts.unret) {
+		read_exports(file);
+		detect_noreturns(file);
+	}
+
 	if (read_unwind_hints(file))
 		return -1;
 
@@ -2675,11 +3263,12 @@ int decode_file(struct objtool_file *file)
 	mark_holes(file);
 
 	/*
-	 * Must be after add_call_destinations() such that it can override
-	 * dead_end_function() marks.
+	 * Must be after detect_noreturns() so it can override dead_end marks.
 	 */
 	if (read_annotate(file, __annotate_late))
 		return -1;
+
+	free_decode_ranges();
 
 	return 0;
 }
@@ -4245,12 +4834,6 @@ static bool ignore_unreachable_insn(struct objtool_file *file, struct instructio
 	    !strcmp(insn->sec->name, ".altinstr_aux"))
 		return true;
 
-	if (!func)
-		return false;
-
-	if (func->static_call_tramp)
-		return true;
-
 	/*
 	 * CONFIG_UBSAN_TRAP inserts a UD2 when it sees
 	 * __builtin_unreachable().  The BUG() macro has an unreachable() after
@@ -4264,6 +4847,12 @@ static bool ignore_unreachable_insn(struct objtool_file *file, struct instructio
 	    (insn->type == INSN_BUG ||
 	     (insn->type == INSN_JUMP_UNCONDITIONAL &&
 	      insn->jump_dest && insn->jump_dest->type == INSN_BUG)))
+		return true;
+
+	if (!func)
+		return false;
+
+	if (func->static_call_tramp)
 		return true;
 
 	/*
@@ -4722,7 +5311,7 @@ static int validate_reachable_instructions(struct objtool_file *file)
 		if (prev_insn && prev_insn->dead_end) {
 			call_dest = insn_call_dest(prev_insn);
 			if (call_dest) {
-				WARN_INSN(insn, "%s() missing __noreturn in .c/.h or NORETURN() in noreturns.h",
+				WARN_INSN(insn, "%s() is missing __noreturn in .c/.h",
 					  call_dest->name);
 				warnings++;
 				continue;
@@ -4803,6 +5392,9 @@ void free_insns(struct objtool_file *file)
 
 	for (chunk = chunks; chunk; chunk = chunk->next)
 		free(chunk->addr);
+
+	free(file->insn_hash);
+	file->insn_hash = NULL;
 }
 
 const char *objtool_disas_insn(struct instruction *insn)
@@ -4834,6 +5426,14 @@ int check(struct objtool_file *file)
 		objtool_disas_ctx = disas_ctx;
 	}
 
+	if (opts.noreturns_read) {
+		ret = read_noreturns(file);
+		if (ret)
+			goto out;
+	}
+
+	read_annotate_noreturn(file);
+
 	ret = decode_file(file);
 	if (ret)
 		goto out;
@@ -4849,8 +5449,10 @@ int check(struct objtool_file *file)
 
 		w += validate_functions(file);
 		w += validate_unwind_hints(file, NULL);
-		if (!w)
+		if (!w) {
 			w += validate_reachable_instructions(file);
+			w += validate_noreturns(file);
+		}
 
 		warnings += w;
 
@@ -4937,6 +5539,12 @@ int check(struct objtool_file *file)
 
 	if (opts.orc && nr_insns) {
 		ret = orc_create(file);
+		if (ret)
+			goto out;
+	}
+
+	if (opts.noreturns_write && !opts.dryrun) {
+		ret = write_noreturns(file);
 		if (ret)
 			goto out;
 	}

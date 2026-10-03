@@ -121,6 +121,14 @@ multi-obj-m	:= $(addprefix $(obj)/, $(multi-obj-m))
 subdir-ym	:= $(addprefix $(obj)/, $(subdir-ym))
 endif
 
+# Cache which list each object is in and which composite objects it belongs to,
+# once per object for $(part-of-builtin), $(part-of-module) and $(modname-multi).
+$(foreach o, $(real-obj-y) $(lib-y), $(eval part-of-builtin_$o := y))
+$(foreach o, $(real-obj-m), $(eval part-of-module_$o := y))
+$(foreach m, $(multi-obj-ym), \
+	$(foreach o, $(call suffix-search, $m, .o, -objs -y -m), \
+		$(eval modname-multi_$o += $(m:.o=))))
+
 ifndef obj
 $(warning kbuild: Makefile.build is included improperly)
 endif
@@ -270,15 +278,21 @@ cmd_record_mcount = $(if $(findstring $(strip $(CC_FLAGS_FTRACE)),$(_c_flags)),	
 	$(sub_cmd_record_mcount))
 endif # CONFIG_FTRACE_MCOUNT_USE_RECORDMCOUNT
 
-# 'OBJECT_FILES_NON_STANDARD := y': skip objtool checking for a directory
-# 'OBJECT_FILES_NON_STANDARD_foo.o := 'y': skip objtool checking for a file
-# 'OBJECT_FILES_NON_STANDARD_foo.o := 'n': override directory skip for a file
-
+ifdef CONFIG_OBJTOOL
+#
+# NOTE: these variables are deprecated, and have no effect when
+# CONFIG_OBJTOOL_DEFERRED is enabled.  Objtool-allergic code can instead be
+# marked with STACK_FRAME_NON_STANDARD() or ANNOTATE_*().
+#
+#   'OBJECT_FILES_NON_STANDARD := y': skip objtool checking for a directory
+#   'OBJECT_FILES_NON_STANDARD_foo.o := 'y': skip objtool checking for a file
+#   'OBJECT_FILES_NON_STANDARD_foo.o := 'n': override directory skip for a file
+#
 is-standard-object = $(if $(filter-out y%, $(OBJECT_FILES_NON_STANDARD_$(target-stem).o)$(OBJECT_FILES_NON_STANDARD)n),$(is-kernel-object))
 
-ifdef CONFIG_OBJTOOL
-$(obj)/%.o: private objtool-enabled = $(if $(is-standard-object),$(if $(delay-objtool),$(is-single-obj-m),y))
-endif
+# Enable per-TU objtool for !CONFIG_OBJTOOL_DEFERRED
+$(obj)/%.o: private objtool-enabled = $(if $(CONFIG_OBJTOOL_DEFERRED),,$(if $(is-standard-object),y))
+endif # CONFIG_OBJTOOL
 
 ifneq ($(findstring 1, $(KBUILD_EXTRA_WARN)),)
 cmd_warn_shared_object = $(if $(word 2, $(modname-multi)),$(warning $(kbuild-file): $*.o is added to multiple modules: $(modname-multi)))
@@ -351,8 +365,11 @@ quiet_cmd_rustc_o_rs = $(RUSTC_OR_CLIPPY_QUIET) $(quiet_modtag) $@
 		$(cmd_ld_single)) \
 	$(cmd_objtool)
 
+rust-dir-ok = $(or $(KBUILD_EXTMOD),$(filter rust $(KBUILD_RUST_DIRS),$(firstword $(subst /, ,$@))))
+
+# Ensure that any rust code located elsewhere from rust/ is listed in KBUILD_RUST_DIRS.
 define rule_rustc_o_rs
-	$(call cmd_and_fixdep,rustc_o_rs)
+	$(if $(rust-dir-ok),,$(error $@: Rust code in a directory not listed in KBUILD_RUST_DIRS, see the top Makefile))$(call cmd_and_fixdep,rustc_o_rs)
 	$(call cmd,gen_objtooldep)
 endef
 
@@ -496,17 +513,10 @@ $(obj)/lib.a: $(lib-y) FORCE
 	$(call if_changed,ar)
 
 quiet_cmd_ld_multi_m = LD [M]  $@
-      cmd_ld_multi_m = $(LD) $(ld_flags) -r -o $@ @$< $(cmd_objtool)
+      cmd_ld_multi_m = $(LD) $(ld_flags) -r -o $@ @$<
 
-define rule_ld_multi_m
-	$(call cmd_and_savecmd,ld_multi_m)
-	$(call cmd,gen_objtooldep)
-endef
-
-$(multi-obj-m): private objtool-enabled := $(delay-objtool)
-$(multi-obj-m): private part-of-module := y
 $(multi-obj-m): %.o: %.mod FORCE
-	$(call if_changed_rule,ld_multi_m)
+	$(call if_changed,ld_multi_m)
 $(call multi_depend, $(multi-obj-m), .o, -objs -y -m)
 
 # Add intermediate targets:
@@ -583,7 +593,20 @@ $(obj)/: $(if $(KBUILD_BUILTIN), $(targets-for-builtin)) \
 
 existing-targets := $(wildcard $(sort $(targets)))
 
--include $(foreach f,$(existing-targets),$(dir $(f)).$(notdir $(f)).cmd)
+cmd-files := $(wildcard $(foreach f,$(existing-targets),$(dir $(f)).$(notdir $(f)).cmd))
+
+# depcheck checks timestamps first and outputs only saved command lines of
+# up-to-date targets, falling back to .cmd files if it fails. A directory
+# whose targets all lie elsewhere may not exist in the output tree.
+depcheck := $(wildcard $(objtree)/scripts/basic/depcheck)
+
+ifneq ($(and $(depcheck),$(cmd-files),$(wildcard $(obj))),)
+ifeq ($(shell $(depcheck) $(obj)/.depcheck.mk $(cmd-files) && echo ok),ok)
+cmd-files := $(obj)/.depcheck.mk
+endif
+endif
+
+-include $(cmd-files)
 
 # Create directories for object files if they do not exist
 obj-dirs := $(sort $(patsubst %/,%, $(dir $(targets))))
