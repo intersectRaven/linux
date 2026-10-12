@@ -1360,10 +1360,12 @@ static void rcu_free_pages(struct list_head *list)
 {
 	struct folio_batch fbatch;
 	struct folio *folio, *next;
+	unsigned long nr = 0;
 
 	folio_batch_init(&fbatch);
 	/* Freeing a folio reuses its ->lru: @next is read before that */
 	list_for_each_entry_safe(folio, next, list, lru) {
+		nr += folio_nr_pages(folio);
 		if (!folio_batch_add(&fbatch, folio)) {
 			free_unref_folios(&fbatch);
 			/* Unbounded: one truncate can put a whole file here */
@@ -1372,6 +1374,7 @@ static void rcu_free_pages(struct list_head *list)
 	}
 	if (folio_batch_count(&fbatch))
 		free_unref_folios(&fbatch);
+	count_vm_events(PGFREE_RCU_DONE, nr);
 }
 
 static void rcu_free_workfn(struct work_struct *work)
@@ -1443,6 +1446,7 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 	    !(PageHWPoison(page) && !order)) {
 		VM_WARN_ON_ONCE(fpi_flags & FPI_TRYLOCK);
 		__folio_clear_rcu_free(folio);
+		count_vm_events(PGFREE_RCU, 1 << order);
 		rcu_free_defer(folio);
 		return false;
 	}
