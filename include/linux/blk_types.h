@@ -322,6 +322,8 @@ enum {
 	BIO_REMAPPED,
 	BIO_ZONE_WRITE_PLUGGING, /* bio handled through zone write plugging */
 	BIO_EMULATES_ZONE_APPEND, /* bio emulates a zone append operation */
+	/* Pre-validated, pre-DMA-mapped bio owned by an io_uring io_slot */
+	BIO_REGISTERED,
 	BIO_FLAG_LAST
 };
 
