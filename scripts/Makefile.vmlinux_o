@@ -30,19 +30,14 @@ endif
 # objtool for vmlinux.o
 # ---------------------------------------------------------------------------
 #
-# For delay-objtool (IBT or LTO), objtool doesn't run on individual translation
+# For CONFIG_OBJTOOL_DEFERRED, objtool doesn't run on individual translation
 # units.  Instead it runs on vmlinux.o.
-#
-# For !delay-objtool + CONFIG_NOINSTR_VALIDATION, it runs on both translation
-# units and vmlinux.o, with the latter only used for noinstr/unret validation.
 
-objtool-enabled := $(or $(delay-objtool),$(CONFIG_NOINSTR_VALIDATION))
+objtool-enabled := $(CONFIG_OBJTOOL_DEFERRED)
 
-ifeq ($(delay-objtool),y)
 vmlinux-objtool-args-y					+= $(objtool-args-y)
-else
-vmlinux-objtool-args-$(CONFIG_OBJTOOL_WERROR)		+= --werror
-endif
+
+vmlinux-objtool-args-$(CONFIG_OBJTOOL_CONTROL_FLOW)	+= --noreturns-write=scripts/noreturns.builtin
 
 vmlinux-objtool-args-$(CONFIG_NOINSTR_VALIDATION)	+= --noinstr \
 							   $(if $(or $(CONFIG_MITIGATION_UNRET_ENTRY),$(CONFIG_MITIGATION_SRSO)), --unret)

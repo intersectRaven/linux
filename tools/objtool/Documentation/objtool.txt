@@ -330,12 +330,11 @@ the objtool maintainers.
    traces and want objtool to ignore it, see "Adding exceptions" below.
 
 
-3. file.o: warning: objtool: foo+0x48c: bar() missing __noreturn in .c/.h or NORETURN() in noreturns.h
+3. file.o: warning: objtool: foo+0x48c: bar() is missing __noreturn in .c/.h
 
    The call from foo() to bar() doesn't return, but bar() is incorrectly
    annotated.  A noreturn function must be marked __noreturn in both its
-   declaration and its definition, and must have a NORETURN() annotation
-   in tools/objtool/noreturns.h.
+   declaration and its definition.
 
 
 4. file.o: warning: objtool: func(): can't find starting instruction
@@ -393,9 +392,8 @@ the objtool maintainers.
    reasons for this:
 
    a) funcA()'s last instruction is a call to a "noreturn" function like
-      panic().  In this case the noreturn function needs to be added to
-      objtool's hard-coded global_noreturns array.  Feel free to bug the
-      objtool maintainer, or you can submit a patch.
+      panic(), and objtool doesn't know that function never returns.  See
+      warnings 3 and 13.
 
    b) funcA() uses the unreachable() annotation in a section of code
       that is actually reachable.
@@ -455,6 +453,26 @@ the objtool maintainers.
     happens for init_module() or cleanup_module() if a module relies on
     these special names and does not use module_init() / module_exit()
     macros to create them.
+
+
+13. file.o: warning: objtool: func() is exported and noreturn, its declaration needs __noreturn and ANNOTATE_EXPORTED_NORETURN()
+
+    func() is exported and never returns, but is defined in a module, so
+    its noreturn status needs to be manually annotated.  Put an
+    ANNOTATE_EXPORTED_NORETURN() next to its declaration.
+
+    Mark the declaration __noreturn while you're there, if it isn't
+    already.  The two go together: __noreturn stops the compiler from
+    emitting code after the call, and the annotation tells objtool the
+    call doesn't return.
+
+
+14. file.o: warning: objtool: func() has ANNOTATE_EXPORTED_NORETURN() but returns
+
+    func() is annotated as never returning, but it does.  Usually this
+    means the annotation outlived the fact: the function grew a return path
+    and the ANNOTATE_EXPORTED_NORETURN() next to its declaration was left
+    behind.  Remove it, along with the __noreturn.
 
 
 If the error doesn't seem to make sense, it could be a bug in objtool.
