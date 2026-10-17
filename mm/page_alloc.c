@@ -1309,6 +1309,180 @@ static inline void pgalloc_tag_sub_pages(struct alloc_tag *tag, unsigned int nr)
 
 #endif /* CONFIG_MEM_ALLOC_PROFILING */
 
+/*
+ * Folios with PG_rcu_free set wait here for an RCU grace period before
+ * they go back to the allocator.  They are linked through ->lru: a folio
+ * whose refcount has reached zero is on no LRU and not yet on the
+ * allocator's lists.
+ *
+ * Each CPU has at most one grace period of @rwork in flight.  @batch holds
+ * the folios it covers: they were moved from @pending when
+ * queue_rcu_work() started it.  Folios freed meanwhile collect on
+ * @pending.  When the grace period ends, the work takes @batch, moves
+ * @pending to @batch and starts the next grace period, and then frees
+ * what it took.  The move and the queue_rcu_work() happen together under
+ * @lock, so no folio joins a batch after its grace period started.  A
+ * folio waits one to two grace periods, or one expedited grace period if
+ * @expedite takes it from @pending.
+ *
+ * @batch is non-empty from the queue_rcu_work() until the work has taken
+ * it.  So @batch being empty means that no grace period of @rwork is in
+ * flight and @rwork is not queued.
+ *
+ * Reclaim makes progress only when these frees complete, so the work must
+ * not wait for a new worker: the workqueue is WQ_MEM_RECLAIM.
+ *
+ * The allocator does not see the folios on these lists, and a CPU that
+ * frees faster than grace periods end can put any amount of memory here.
+ * So @nr_pending counts the pages on @pending, and above
+ * RCU_FREE_EXPEDITE the CPU queues @expedite, which takes @pending and
+ * runs an expedited grace period for it.
+ *
+ * rcu_free_init() runs before vfs_caches_init(), so before anything can
+ * be mounted: no folio is in a page cache until the workqueue exists.
+ */
+#define RCU_FREE_EXPEDITE	1024
+
+struct rcu_free_pcpu {
+	spinlock_t lock;
+	struct list_head pending;
+	struct list_head batch;
+	unsigned long nr_pending;
+	struct rcu_work rwork;
+	struct work_struct expedite;
+};
+static DEFINE_PER_CPU(struct rcu_free_pcpu, rcu_free_pcpu) = {
+	.lock = __SPIN_LOCK_UNLOCKED(rcu_free_pcpu.lock),
+};
+static struct workqueue_struct *rcu_free_wq __ro_after_init;
+
+/* Called with r->lock held */
+static void rcu_free_start(struct rcu_free_pcpu *r)
+{
+	/* A grace period is in flight: its work starts the next one */
+	if (!list_empty(&r->batch))
+		return;
+
+	list_splice_init(&r->pending, &r->batch);
+	r->nr_pending = 0;
+	if (!list_empty(&r->batch))
+		WARN_ON_ONCE(!queue_rcu_work(rcu_free_wq, &r->rwork));
+}
+
+static void rcu_free_pages(struct list_head *list)
+{
+	struct folio_batch fbatch;
+	struct folio *folio, *next;
+	struct zone *zone = NULL;
+	unsigned long nr = 0;
+	long zone_nr = 0;
+
+	folio_batch_init(&fbatch);
+	/* Freeing a folio reuses its ->lru: @next is read before that */
+	list_for_each_entry_safe(folio, next, list, lru) {
+		nr += folio_nr_pages(folio);
+		/* Uncount a zone's folios only once they are free */
+		if (folio_zone(folio) != zone) {
+			if (zone) {
+				if (folio_batch_count(&fbatch))
+					free_unref_folios(&fbatch);
+				mod_zone_page_state(zone, NR_FREE_RCU_PAGES, -zone_nr);
+			}
+			zone = folio_zone(folio);
+			zone_nr = 0;
+		}
+		zone_nr += folio_nr_pages(folio);
+		if (!folio_batch_add(&fbatch, folio)) {
+			free_unref_folios(&fbatch);
+			/* Unbounded: one truncate can put a whole file here */
+			cond_resched();
+		}
+	}
+	if (folio_batch_count(&fbatch))
+		free_unref_folios(&fbatch);
+	if (zone)
+		mod_zone_page_state(zone, NR_FREE_RCU_PAGES, -zone_nr);
+	count_vm_events(PGFREE_RCU_DONE, nr);
+}
+
+static void rcu_free_workfn(struct work_struct *work)
+{
+	struct rcu_free_pcpu *r = container_of(to_rcu_work(work),
+					       struct rcu_free_pcpu, rwork);
+	LIST_HEAD(done);
+
+	spin_lock_irq(&r->lock);
+	list_splice_init(&r->batch, &done);
+	rcu_free_start(r);
+	spin_unlock_irq(&r->lock);
+
+	rcu_free_pages(&done);
+}
+
+/*
+ * Take @pending and free it after an expedited grace period, which starts
+ * once the folios are off the list.  Only this work waits for it.
+ *
+ * @batch is left alone: its grace period is in flight and @rwork frees it.
+ */
+static void rcu_free_expedite_workfn(struct work_struct *work)
+{
+	struct rcu_free_pcpu *r = container_of(work, struct rcu_free_pcpu,
+					       expedite);
+	LIST_HEAD(list);
+
+	spin_lock_irq(&r->lock);
+	list_splice_init(&r->pending, &list);
+	r->nr_pending = 0;
+	spin_unlock_irq(&r->lock);
+
+	/* @rwork got there first and moved @pending to @batch */
+	if (list_empty(&list))
+		return;
+
+	count_vm_event(PGFREE_RCU_KICK);
+	synchronize_rcu_expedited();
+	rcu_free_pages(&list);
+}
+
+static void rcu_free_expedite(struct rcu_free_pcpu *r, unsigned long limit)
+{
+	/* Unlocked: a stale @nr_pending moves the expedite by one free */
+	if (data_race(r->nr_pending) > limit && !work_pending(&r->expedite))
+		queue_work(rcu_free_wq, &r->expedite);
+}
+
+static void rcu_free_defer(struct folio *folio, unsigned int order)
+{
+	struct rcu_free_pcpu *r = raw_cpu_ptr(&rcu_free_pcpu);
+	unsigned long flags;
+
+	spin_lock_irqsave(&r->lock, flags);
+	__mod_zone_page_state(folio_zone(folio), NR_FREE_RCU_PAGES, 1 << order);
+	list_add_tail(&folio->lru, &r->pending);
+	r->nr_pending += folio_nr_pages(folio);
+	rcu_free_start(r);
+	spin_unlock_irqrestore(&r->lock, flags);
+
+	rcu_free_expedite(r, RCU_FREE_EXPEDITE);
+}
+
+static void __init rcu_free_init(void)
+{
+	int cpu;
+
+	rcu_free_wq = alloc_workqueue("rcu_free", WQ_MEM_RECLAIM | WQ_PERCPU, 0);
+
+	for_each_possible_cpu(cpu) {
+		struct rcu_free_pcpu *r = per_cpu_ptr(&rcu_free_pcpu, cpu);
+
+		INIT_LIST_HEAD(&r->pending);
+		INIT_LIST_HEAD(&r->batch);
+		INIT_RCU_WORK(&r->rwork, rcu_free_workfn);
+		INIT_WORK(&r->expedite, rcu_free_expedite_workfn);
+	}
+}
+
 static __always_inline bool __free_pages_prepare(struct page *page,
 		unsigned int order, fpi_t fpi_flags)
 {
@@ -1322,6 +1496,26 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 		return true;
 
 	VM_BUG_ON_PAGE(PageTail(page), page);
+
+	/*
+	 * Defer: rcu_free_pages() frees the folio after a grace period, and
+	 * it comes through here again with the flag clear.  rcu_free_defer()
+	 * takes a spinlock, so the flag must not be set on a folio freed
+	 * with free_pages_nolock() (FPI_TRYLOCK).
+	 *
+	 * Not for a hwpoisoned order-0 page: it never reaches the allocator
+	 * (see below), and page_handle_poison() takes a reference on it right
+	 * after the put that brought it here, so rcu_free_pages() would free
+	 * a page that has a reference.
+	 */
+	if (unlikely(folio_test_rcu_free(folio)) &&
+	    !(PageHWPoison(page) && !order)) {
+		VM_WARN_ON_ONCE(fpi_flags & FPI_TRYLOCK);
+		__folio_clear_rcu_free(folio);
+		count_vm_events(PGFREE_RCU, 1 << order);
+		rcu_free_defer(folio, order);
+		return false;
+	}
 
 	trace_mm_page_free(page, order);
 	kmsan_free_page(page, order);
@@ -4624,6 +4818,80 @@ bool gfp_pfmemalloc_allowed(gfp_t gfp_mask)
 }
 
 /*
+ * Free what every CPU deferred before now.  A folio on ->pending joins a
+ * grace period only when the work of the batch in flight starts the next
+ * one, so waiting for a grace period alone leaves it there.  Take the
+ * pending lists first: those folios were deferred before the grace period
+ * waited for here starts, so they can be freed once it has ended.  The
+ * batches in flight are left to their work: rcu_free_start() takes a
+ * non-empty ->batch to mean that a grace period is in flight.
+ */
+static void rcu_free_drain(void)
+{
+	LIST_HEAD(taken);
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct rcu_free_pcpu *r = per_cpu_ptr(&rcu_free_pcpu, cpu);
+
+		spin_lock_irq(&r->lock);
+		list_splice_tail_init(&r->pending, &taken);
+		r->nr_pending = 0;
+		spin_unlock_irq(&r->lock);
+	}
+	synchronize_rcu_expedited();
+	rcu_free_pages(&taken);
+	count_vm_event(PGFREE_RCU_DRAIN);
+}
+
+/*
+ * Reclaim is about to give up.  Pages freed meanwhile may still wait for a
+ * grace period (NR_FREE_RCU_PAGES).  If they would bring an eligible zone
+ * above its min watermark, drain them and retry, up to
+ * MAX_RECLAIM_RETRIES times per no-progress streak.  An OOM victim or a
+ * task with a fatal signal pending goes the way it goes without this: its
+ * exit is what frees memory.
+ */
+static bool rcu_free_wait(gfp_t gfp_mask, unsigned int order,
+			  struct alloc_context *ac, int alloc_flags,
+			  int *rcu_free_waits)
+{
+	struct zone *zone;
+	struct zoneref *z;
+
+	if (tsk_is_oom_victim(current) || fatal_signal_pending(current))
+		return false;
+	if (*rcu_free_waits >= MAX_RECLAIM_RETRIES ||
+	    order > PAGE_ALLOC_COSTLY_ORDER)
+		return false;
+
+	for_each_zone_zonelist_nodemask(zone, z, ac->zonelist,
+				ac->highest_zoneidx, ac->nodemask) {
+		unsigned long waiting, available;
+
+		if (cpusets_enabled() && (alloc_flags & ALLOC_CPUSET) &&
+		    !__cpuset_zone_allowed(zone, gfp_mask))
+			continue;
+
+		waiting = zone_page_state_snapshot(zone, NR_FREE_RCU_PAGES);
+		if (!waiting)
+			continue;
+
+		available = zone_reclaimable_pages(zone) + waiting;
+		available += zone_page_state_snapshot(zone, NR_FREE_PAGES);
+		if (__zone_watermark_ok(zone, order, min_wmark_pages(zone),
+					ac->highest_zoneidx, alloc_flags,
+					available)) {
+			(*rcu_free_waits)++;
+			rcu_free_drain();
+			return true;
+		}
+	}
+
+	return false;
+}
+
+/*
  * Checks whether it makes sense to retry the reclaim to make a forward progress
  * for the given allocation request.
  *
@@ -4636,7 +4904,8 @@ bool gfp_pfmemalloc_allowed(gfp_t gfp_mask)
 static inline bool
 should_reclaim_retry(gfp_t gfp_mask, unsigned order,
 		     struct alloc_context *ac, int alloc_flags,
-		     bool did_some_progress, int *no_progress_loops)
+		     bool did_some_progress, int *no_progress_loops,
+		     int *rcu_free_waits)
 {
 	struct zone *zone;
 	struct zoneref *z;
@@ -4647,10 +4916,12 @@ should_reclaim_retry(gfp_t gfp_mask, unsigned order,
 	 * their order will become available due to high fragmentation so
 	 * always increment the no progress counter for them
 	 */
-	if (did_some_progress && order <= PAGE_ALLOC_COSTLY_ORDER)
+	if (did_some_progress && order <= PAGE_ALLOC_COSTLY_ORDER) {
 		*no_progress_loops = 0;
-	else
+		*rcu_free_waits = 0;
+	} else {
 		(*no_progress_loops)++;
+	}
 
 	if (*no_progress_loops > MAX_RECLAIM_RETRIES)
 		goto out;
@@ -4703,6 +4974,10 @@ should_reclaim_retry(gfp_t gfp_mask, unsigned order,
 	else
 		cond_resched();
 out:
+	if (!ret && rcu_free_wait(gfp_mask, order, ac, alloc_flags,
+				  rcu_free_waits))
+		return true;
+
 	/* Before OOM, exhaust highatomic_reserve */
 	if (!ret)
 		return unreserve_highatomic_pageblock(ac, true);
@@ -4792,6 +5067,7 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 	enum compact_result compact_result;
 	int compaction_retries;
 	int no_progress_loops;
+	int rcu_free_waits;
 	unsigned int cpuset_mems_cookie;
 	unsigned int zonelist_iter_cookie;
 	int reserve_flags;
@@ -4816,6 +5092,7 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 restart:
 	compaction_retries = 0;
 	no_progress_loops = 0;
+	rcu_free_waits = 0;
 	compact_result = COMPACT_SKIPPED;
 	compact_priority = DEF_COMPACT_PRIORITY;
 	cpuset_mems_cookie = read_mems_allowed_begin();
@@ -4990,7 +5267,8 @@ retry:
 		goto restart;
 
 	if (should_reclaim_retry(gfp_mask, order, ac, alloc_flags,
-				 did_some_progress > 0, &no_progress_loops))
+				 did_some_progress > 0, &no_progress_loops,
+				 &rcu_free_waits))
 		goto retry;
 
 	/*
@@ -5033,6 +5311,7 @@ retry:
 	/* Retry as long as the OOM killer is making progress */
 	if (did_some_progress) {
 		no_progress_loops = 0;
+		rcu_free_waits = 0;
 		goto retry;
 	}
 
@@ -6313,6 +6592,8 @@ void __init setup_per_cpu_pageset(void)
 	for_each_online_pgdat(pgdat)
 		pgdat->per_cpu_nodestats =
 			alloc_percpu(struct per_cpu_nodestat);
+
+	rcu_free_init();
 }
 
 __meminit void zone_pcp_init(struct zone *zone)

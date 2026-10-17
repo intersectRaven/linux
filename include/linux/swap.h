@@ -307,7 +307,6 @@ extern unsigned long totalreserve_pages;
 /* Definition of global_zone_page_state not available yet */
 #define nr_free_pages() global_zone_page_state(NR_FREE_PAGES)
 
-
 /* linux/mm/swap.c */
 void lru_note_cost_unlock_irq(struct lruvec *lruvec, bool file,
 		unsigned int nr_io, unsigned int nr_rotated);
@@ -315,7 +314,7 @@ void lru_note_cost_refault(struct folio *);
 void folio_add_lru(struct folio *);
 void folio_add_lru_vma(struct folio *, struct vm_area_struct *);
 void mark_page_accessed(struct page *);
-void folio_mark_accessed(struct folio *);
+bool folio_mark_accessed(struct folio *);
 
 static inline bool folio_may_be_lru_cached(struct folio *folio)
 {
