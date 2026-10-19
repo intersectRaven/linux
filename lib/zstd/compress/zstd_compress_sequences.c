@@ -12,6 +12,10 @@
  /*-*************************************
  *  Dependencies
  ***************************************/
+#include "../common/zstd_deps.h"
+#if defined(ZSTD_USE_KERNEL_CPU_FEATURES)
+#include <asm/cpufeature.h>
+#endif
 #include "zstd_compress_sequences.h"
 
 /*
@@ -415,6 +419,10 @@ ZSTD_encodeSequences_bmi2(
                                     sequences, nbSeq, longOffsets);
 }
 
+#else
+
+#define ZSTD_encodeSequences_bmi2 ZSTD_encodeSequences_default
+
 #endif
 
 size_t ZSTD_encodeSequences(
@@ -425,15 +433,13 @@ size_t ZSTD_encodeSequences(
             SeqDef const* sequences, size_t nbSeq, int longOffsets, int bmi2)
 {
     DEBUGLOG(5, "ZSTD_encodeSequences: dstCapacity = %u", (unsigned)dstCapacity);
-#if DYNAMIC_BMI2
-    if (bmi2) {
+    if (ZSTD_USE_BMI2(bmi2)) {
         return ZSTD_encodeSequences_bmi2(dst, dstCapacity,
                                          CTable_MatchLength, mlCodeTable,
                                          CTable_OffsetBits, ofCodeTable,
                                          CTable_LitLength, llCodeTable,
                                          sequences, nbSeq, longOffsets);
     }
-#endif
     (void)bmi2;
     return ZSTD_encodeSequences_default(dst, dstCapacity,
                                         CTable_MatchLength, mlCodeTable,
