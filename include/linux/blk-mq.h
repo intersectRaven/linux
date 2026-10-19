@@ -64,6 +64,12 @@ enum rqf_flags {
 	/* ->timeout has been called, don't expire again */
 	__RQF_TIMED_OUT,
 	__RQF_RESV,
+	/*
+	 * Mirror of BIO_REGISTERED on rq->bio at submit time. May be cleared
+	 * by the driver if it falls back from a registered fast path to a
+	 * regular setup that needs the standard completion teardown.
+	 */
+	__RQF_REGISTERED,
 	__RQF_BITS
 };
 
@@ -85,6 +91,7 @@ enum rqf_flags {
 			((__force req_flags_t)(1 << __RQF_ZONE_WRITE_PLUGGING))
 #define RQF_TIMED_OUT		((__force req_flags_t)(1 << __RQF_TIMED_OUT))
 #define RQF_RESV		((__force req_flags_t)(1 << __RQF_RESV))
+#define RQF_REGISTERED		((__force req_flags_t)(1 << __RQF_REGISTERED))
 
 /* flags that prevent us from merging requests: */
 #define RQF_NOMERGE_FLAGS \
