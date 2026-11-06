@@ -164,9 +164,10 @@ static struct io_mapped_ubuf *io_alloc_imu(struct io_ring_ctx *ctx,
 	struct io_mapped_ubuf *imu;
 
 	if (nr_bvecs <= IO_CACHED_BVECS_SEGS)
-		imu = io_cache_alloc(&ctx->imu_cache, GFP_KERNEL);
+		imu = io_cache_alloc(&ctx->imu_cache, GFP_KERNEL_ACCOUNT);
 	else
-		imu = kvmalloc_flex(struct io_mapped_ubuf, bvec, nr_bvecs);
+		imu = kvmalloc_flex(struct io_mapped_ubuf, bvec, nr_bvecs,
+				    GFP_KERNEL_ACCOUNT);
 	if (imu)
 		INIT_LIST_HEAD(&imu->dma_mappings);
 	return imu;
@@ -238,7 +239,7 @@ struct io_rsrc_node *io_rsrc_node_alloc(struct io_ring_ctx *ctx, int type)
 {
 	struct io_rsrc_node *node;
 
-	node = io_cache_alloc(&ctx->node_cache, GFP_KERNEL);
+	node = io_cache_alloc(&ctx->node_cache, GFP_KERNEL_ACCOUNT);
 	if (node) {
 		node->type = type;
 		node->refs = 1;
